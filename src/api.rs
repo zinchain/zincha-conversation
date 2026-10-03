@@ -16,7 +16,7 @@ use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
 use crate::{
-    crypto::now_ms,
+    crypto::{now_ms, random_bytes},
     error::{Error, Result},
     model::{
         AcknowledgeRequest, ChallengeRequest, ConversationProfileV1, ResolveConversationRequest,
@@ -292,9 +292,15 @@ async fn stream_events(
         }
         drop(replay_permit);
         let mut last_delivered = last_replayed;
-        let mut authorization_tick = tokio::time::interval(authorization_interval);
+        let authorization_interval_ms = authorization_interval.as_millis().min(u128::from(u64::MAX)) as u64;
+        let authorization_jitter_ms = u64::from_le_bytes(random_bytes::<8>())
+            % authorization_interval_ms.max(1)
+            + 1;
+        let mut authorization_tick = tokio::time::interval_at(
+            tokio::time::Instant::now() + Duration::from_millis(authorization_jitter_ms),
+            authorization_interval,
+        );
         authorization_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        authorization_tick.tick().await;
         let session_deadline = Duration::from_millis(
             auth_session.expires_at_ms.saturating_sub(now_ms()).max(0) as u64,
         );
@@ -319,7 +325,7 @@ async fn stream_events(
                 },
                 _ = authorization_tick.tick() => {
                     if auth_service
-                        .conversation(&auth_session, &auth_conversation_id, false)
+                        .revalidate_stream_session(&auth_session, &auth_conversation_id)
                         .await
                         .is_err()
                     {

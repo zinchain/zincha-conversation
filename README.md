@@ -8,12 +8,12 @@ The service has no unsolicited inbox. A caller must prove an account-signed dele
 
 - Existing participant-authorized Zincha node endpoints supply the requester, provider, parties, arbitrators, status, and terminal lifecycle timestamp. No new node endpoint or consensus rule is required.
 - An account signs a bounded `ConversationKeyDelegationV1` once. The delegated Ed25519 key authenticates challenges and messages without asking a wallet to sign every conversational turn.
-- The server refreshes chain authorization when its cached projection is older than the configured staleness limit. Normal message reads and writes do not call the node.
+- The server refreshes chain authorization when its cached projection is older than the configured staleness limit. Concurrent stale requests for one conversation share one in-flight refresh, and normal message reads and writes do not call the node.
 - PostgreSQL is the production store. SQLite with WAL mode is supported for one local process.
 - Platform-readable payloads are encrypted at rest with XChaCha20-Poly1305 and message-bound associated data. End-to-end payloads are opaque ciphertext; the public SDKs implement X25519 + HKDF-SHA256 + XChaCha20-Poly1305 envelope encryption.
 - Message IDs are idempotency keys. Per-conversation sequences, the message row, and the durable event row commit in one database transaction.
 - Challenge consumption, delegation insertion, and bearer-session creation also commit in one database transaction. A conflict or database failure cannot consume a valid challenge without creating its session.
-- SSE consumers subscribe before replay is read, preventing a replay/live gap. A bounded replay that cannot catch up returns `resync_required`. Long-lived streams revalidate chain-derived access on the configured interval and close with `authorization_required` when the session or authorization is no longer valid.
+- SSE consumers subscribe before replay is read, preventing a replay/live gap. A bounded replay that cannot catch up returns `resync_required`. Long-lived streams revalidate chain-derived access on randomized points within the configured interval, avoiding synchronized refresh bursts, and close with `authorization_required` when the session or authorization is no longer valid.
 - Message admission, authenticated message rates, unauthenticated challenge rates, request bodies, page sizes, SSE capacity, concurrent SSE replay, broadcast buffers, database pools, and retention work are bounded.
 - Retention and ephemeral cleanup run as indexed fixed-size slices. Unresolved authentication records disappear after their short session expires; expired/revoked delegations and empty terminal conversation metadata are reclaimed after their horizons. Cleanup cannot turn an aged deployment into one unbounded delete transaction.
 
@@ -68,7 +68,7 @@ See [`openapi.yaml`](openapi.yaml) for the HTTP contract. The Rust, TypeScript, 
 - Backups must include the database and the exact master-key version. Test restoration before reducing backup retention.
 - Set retention values deliberately. The process refuses zero values.
 - Rotate operational delegations rather than long-lived account keys. Revocation invalidates all sessions backed by that delegation immediately.
-- Scrape `GET /metrics` for lock-free message, retry, cumulative insert-time, authorization-refresh, SSE-resync, authorization-close, maintenance-deletion, active-SSE, and in-flight-message metrics. Monitor `429` responses and retention deletion warnings alongside these bounded counters.
+- Scrape `GET /metrics` for lock-free message, retry, cumulative insert-time, authorization-refresh, SSE-resync, authorization-close, maintenance-deletion, active-SSE, in-flight-message, and current/maximum event-loop-lag metrics. Monitor `429` responses and retention deletion warnings alongside these bounded counters.
 - Size the reverse proxy for at least the configured `max_sse_connections`; ordinary-request concurrency is isolated from long-lived streams so 10,000 idle SSE clients do not consume every message/API request slot.
 
 ## Verification
@@ -83,8 +83,9 @@ The service tests cover authorization binding, atomic session establishment,
 encrypted persistence across restart, concurrent idempotent sequencing without
 gaps, immediate revocation, challenge throttling, immutable privacy modes,
 payload-mode enforcement, participant-role projection, coherent chain
-observation, bounded lifecycle pagination, SSE replay/live handoff and lag
-recovery, bounded retention, and cryptographic context binding.
+observation, bounded lifecycle pagination, shared stale-authorization refresh,
+SSE replay/live handoff and lag recovery, bounded retention, cryptographic
+context binding, and rejection of non-contributory X25519 public keys.
 
 SQLite integration tests run on every local and CI invocation. PostgreSQL is
 the production backend and must also pass the staging and resource gates in

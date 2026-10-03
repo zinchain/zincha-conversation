@@ -1,4 +1,10 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    },
+};
 
 use async_trait::async_trait;
 use axum::{
@@ -33,6 +39,10 @@ use zincha_conversation::{
 #[derive(Clone)]
 struct StaticAuthorization {
     snapshot: SubjectSnapshot,
+    calls: Arc<AtomicUsize>,
+    block_next: Arc<AtomicBool>,
+    blocked_call_started: Arc<tokio::sync::Semaphore>,
+    blocked_call_release: Arc<tokio::sync::Semaphore>,
 }
 
 #[async_trait]
@@ -43,7 +53,16 @@ impl AuthorizationSource for StaticAuthorization {
         _provider_address: &str,
         _terminal_write_grace_ms: i64,
     ) -> Result<SubjectSnapshot> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
         assert_eq!(subject, &self.snapshot.subject);
+        if self.block_next.swap(false, Ordering::AcqRel) {
+            self.blocked_call_started.add_permits(1);
+            self.blocked_call_release
+                .acquire()
+                .await
+                .expect("test authorization release semaphore closed")
+                .forget();
+        }
         Ok(self.snapshot.clone())
     }
 }
@@ -56,6 +75,10 @@ struct Fixture {
     subject: SubjectRef,
     participant: String,
     provider: String,
+    authorization_calls: Arc<AtomicUsize>,
+    block_next_authorization: Arc<AtomicBool>,
+    blocked_authorization_started: Arc<tokio::sync::Semaphore>,
+    blocked_authorization_release: Arc<tokio::sync::Semaphore>,
 }
 
 async fn fixture() -> Fixture {
@@ -141,10 +164,20 @@ async fn fixture() -> Fixture {
         },
     };
     let database = Database::connect(&database_url, 4).await.unwrap();
+    let authorization_calls = Arc::new(AtomicUsize::new(0));
+    let block_next_authorization = Arc::new(AtomicBool::new(false));
+    let blocked_authorization_started = Arc::new(tokio::sync::Semaphore::new(0));
+    let blocked_authorization_release = Arc::new(tokio::sync::Semaphore::new(0));
     let service = ConversationService::new(
         config,
         database,
-        Arc::new(StaticAuthorization { snapshot }),
+        Arc::new(StaticAuthorization {
+            snapshot,
+            calls: authorization_calls.clone(),
+            block_next: block_next_authorization.clone(),
+            blocked_call_started: blocked_authorization_started.clone(),
+            blocked_call_release: blocked_authorization_release.clone(),
+        }),
         LocalMasterKey::from_hex(&"44".repeat(32)).unwrap(),
     )
     .await
@@ -158,6 +191,10 @@ async fn fixture() -> Fixture {
         subject,
         participant,
         provider,
+        authorization_calls,
+        block_next_authorization,
+        blocked_authorization_started,
+        blocked_authorization_release,
     }
 }
 
@@ -356,7 +393,13 @@ async fn sessions_conversations_and_messages_survive_service_restart() {
     let restarted = ConversationService::new(
         config,
         Database::connect(&database_url, 4).await.unwrap(),
-        Arc::new(StaticAuthorization { snapshot }),
+        Arc::new(StaticAuthorization {
+            snapshot,
+            calls: Arc::new(AtomicUsize::new(0)),
+            block_next: Arc::new(AtomicBool::new(false)),
+            blocked_call_started: Arc::new(tokio::sync::Semaphore::new(0)),
+            blocked_call_release: Arc::new(tokio::sync::Semaphore::new(0)),
+        }),
         LocalMasterKey::from_hex(&"44".repeat(32)).unwrap(),
     )
     .await
@@ -424,9 +467,117 @@ async fn concurrent_retry_is_idempotent_without_sequence_gaps() {
 }
 
 #[tokio::test]
+async fn concurrent_stale_authorization_uses_one_shared_refresh() {
+    let fixture = fixture().await;
+    let (token, conversation_id, _) = authenticated(&fixture, PrivacyMode::PlatformReadable).await;
+    assert_eq!(fixture.authorization_calls.load(Ordering::Relaxed), 1);
+    let session = fixture.service.authenticate(&token).await.unwrap();
+    let mut conversation = fixture
+        .service
+        .db
+        .get_conversation(&conversation_id)
+        .await
+        .unwrap()
+        .unwrap();
+    conversation.snapshot.observed_at_ms = 0;
+    fixture
+        .service
+        .db
+        .upsert_conversation(&conversation)
+        .await
+        .unwrap();
+
+    let barrier = Arc::new(tokio::sync::Barrier::new(65));
+    let mut attempts = Vec::new();
+    for _ in 0..64 {
+        let service = fixture.service.clone();
+        let session = session.clone();
+        let conversation_id = conversation_id.clone();
+        let barrier = barrier.clone();
+        attempts.push(tokio::spawn(async move {
+            barrier.wait().await;
+            service
+                .conversation(&session, &conversation_id, false)
+                .await
+                .unwrap();
+        }));
+    }
+    barrier.wait().await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        for attempt in attempts {
+            attempt.await.unwrap();
+        }
+    })
+    .await
+    .expect("shared authorization refresh waiters stalled");
+    assert_eq!(fixture.authorization_calls.load(Ordering::Relaxed), 2);
+}
+
+#[tokio::test]
+async fn shared_refresh_survives_the_initiating_request_being_cancelled() {
+    let fixture = fixture().await;
+    let (token, conversation_id, _) = authenticated(&fixture, PrivacyMode::PlatformReadable).await;
+    let session = fixture.service.authenticate(&token).await.unwrap();
+    let mut conversation = fixture
+        .service
+        .db
+        .get_conversation(&conversation_id)
+        .await
+        .unwrap()
+        .unwrap();
+    conversation.snapshot.observed_at_ms = 0;
+    fixture
+        .service
+        .db
+        .upsert_conversation(&conversation)
+        .await
+        .unwrap();
+    fixture
+        .block_next_authorization
+        .store(true, Ordering::Release);
+
+    let initiating_request = {
+        let service = fixture.service.clone();
+        let session = session.clone();
+        let conversation_id = conversation_id.clone();
+        tokio::spawn(async move {
+            service
+                .conversation(&session, &conversation_id, false)
+                .await
+        })
+    };
+    fixture
+        .blocked_authorization_started
+        .acquire()
+        .await
+        .unwrap()
+        .forget();
+    let waiting_request = {
+        let service = fixture.service.clone();
+        let session = session.clone();
+        let conversation_id = conversation_id.clone();
+        tokio::spawn(async move {
+            service
+                .conversation(&session, &conversation_id, false)
+                .await
+        })
+    };
+    tokio::task::yield_now().await;
+    initiating_request.abort();
+    fixture.blocked_authorization_release.add_permits(1);
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), waiting_request)
+        .await
+        .expect("shared authorization refresh stalled after leader cancellation")
+        .unwrap()
+        .unwrap();
+    assert_eq!(fixture.authorization_calls.load(Ordering::Relaxed), 2);
+}
+
+#[tokio::test]
 async fn revocation_immediately_invalidates_existing_session() {
     let fixture = fixture().await;
-    let (token, _conversation_id, delegation_id) =
+    let (token, conversation_id, delegation_id) =
         authenticated(&fixture, PrivacyMode::PlatformReadable).await;
     let session = fixture.service.authenticate(&token).await.unwrap();
     fixture
@@ -435,6 +586,11 @@ async fn revocation_immediately_invalidates_existing_session() {
         .await
         .unwrap();
     assert!(fixture.service.authenticate(&token).await.is_err());
+    assert!(fixture
+        .service
+        .revalidate_stream_session(&session, &conversation_id)
+        .await
+        .is_err());
     let delegation = fixture
         .service
         .db
@@ -549,6 +705,24 @@ async fn session_creation_rejects_replay_and_every_invalid_binding() {
         .unwrap_err()
         .to_string()
         .contains("does not include read"));
+
+    let mut non_contributory_encryption_key = signed_session_request(&fixture).await;
+    non_contributory_encryption_key.delegation.encryption_key = "00".repeat(32);
+    non_contributory_encryption_key.delegation.signature = hex::encode(
+        fixture
+            .account
+            .sign(&delegation_signing_bytes(
+                &non_contributory_encryption_key.delegation,
+            ))
+            .to_bytes(),
+    );
+    assert!(fixture
+        .service
+        .create_session(non_contributory_encryption_key)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("non-contributory X25519"));
 
     let mut bad_account_signature = signed_session_request(&fixture).await;
     bad_account_signature.delegation.signature = "00".repeat(64);
@@ -902,6 +1076,8 @@ async fn metrics_endpoint_exposes_bounded_operational_counters() {
     assert!(text.contains("zincha_conversation_active_sse_connections"));
     assert!(text.contains("zincha_conversation_maintenance_rows_removed_total"));
     assert!(text.contains("zincha_conversation_inflight_sse_replays"));
+    assert!(text.contains("zincha_conversation_event_loop_lag_seconds"));
+    assert!(text.contains("zincha_conversation_event_loop_lag_max_seconds"));
 }
 
 #[tokio::test]

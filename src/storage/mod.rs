@@ -199,6 +199,14 @@ impl Database {
         token_hash: &[u8],
     ) -> Result<()> {
         let delegation_json = serde_json::to_value(delegation)?;
+        let can_read = delegation
+            .capabilities
+            .iter()
+            .any(|capability| capability == "read");
+        let can_write = delegation
+            .capabilities
+            .iter()
+            .any(|capability| capability == "write");
         match self {
             Self::Sqlite(pool) => {
                 // Take SQLite's write lock at the transaction boundary. This
@@ -220,10 +228,11 @@ impl Database {
                     ));
                 }
 
-                let inserted = sqlx::query("INSERT INTO delegations (id, tenant_id, conversation_id, participant_address, operational_signing_key, encryption_key, delegation_json, not_before_ms, expires_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING")
+                let inserted = sqlx::query("INSERT INTO delegations (id, tenant_id, conversation_id, participant_address, operational_signing_key, encryption_key, delegation_json, can_read, can_write, not_before_ms, expires_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING")
                     .bind(delegation.delegation_id.to_string()).bind(&session.tenant_id).bind(&session.conversation_id)
                     .bind(&delegation.participant_address).bind(&delegation.operational_signing_key)
                     .bind(&delegation.encryption_key).bind(delegation_json.to_string())
+                    .bind(can_read).bind(can_write)
                     .bind(delegation.not_before_ms).bind(delegation.expires_at_ms)
                     .execute(&mut *tx).await?.rows_affected();
                 if inserted == 0 {
@@ -260,10 +269,11 @@ impl Database {
                     ));
                 }
 
-                let inserted = sqlx::query("INSERT INTO delegations (id, tenant_id, conversation_id, participant_address, operational_signing_key, encryption_key, delegation_json, not_before_ms, expires_at_ms) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT(id) DO NOTHING")
+                let inserted = sqlx::query("INSERT INTO delegations (id, tenant_id, conversation_id, participant_address, operational_signing_key, encryption_key, delegation_json, can_read, can_write, not_before_ms, expires_at_ms) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT(id) DO NOTHING")
                     .bind(delegation.delegation_id.to_string()).bind(&session.tenant_id).bind(&session.conversation_id)
                     .bind(&delegation.participant_address).bind(&delegation.operational_signing_key)
                     .bind(&delegation.encryption_key).bind(delegation_json)
+                    .bind(can_read).bind(can_write)
                     .bind(delegation.not_before_ms).bind(delegation.expires_at_ms)
                     .execute(&mut *tx).await?.rows_affected();
                 if inserted == 0 {
@@ -295,19 +305,29 @@ impl Database {
         delegation: &ConversationKeyDelegationV1,
     ) -> Result<()> {
         let value = serde_json::to_value(delegation)?;
+        let can_read = delegation
+            .capabilities
+            .iter()
+            .any(|capability| capability == "read");
+        let can_write = delegation
+            .capabilities
+            .iter()
+            .any(|capability| capability == "write");
         let inserted = match self {
             Self::Sqlite(pool) => {
-                sqlx::query("INSERT INTO delegations (id, tenant_id, conversation_id, participant_address, operational_signing_key, encryption_key, delegation_json, not_before_ms, expires_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING")
+                sqlx::query("INSERT INTO delegations (id, tenant_id, conversation_id, participant_address, operational_signing_key, encryption_key, delegation_json, can_read, can_write, not_before_ms, expires_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING")
                     .bind(delegation.delegation_id.to_string()).bind(tenant_id).bind(conversation_id)
                     .bind(&delegation.participant_address).bind(&delegation.operational_signing_key)
                     .bind(&delegation.encryption_key).bind(value.to_string())
+                    .bind(can_read).bind(can_write)
                     .bind(delegation.not_before_ms).bind(delegation.expires_at_ms).execute(pool).await?.rows_affected()
             }
             Self::Postgres(pool) => {
-                sqlx::query("INSERT INTO delegations (id, tenant_id, conversation_id, participant_address, operational_signing_key, encryption_key, delegation_json, not_before_ms, expires_at_ms) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT(id) DO NOTHING")
+                sqlx::query("INSERT INTO delegations (id, tenant_id, conversation_id, participant_address, operational_signing_key, encryption_key, delegation_json, can_read, can_write, not_before_ms, expires_at_ms) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT(id) DO NOTHING")
                     .bind(delegation.delegation_id.to_string()).bind(tenant_id).bind(conversation_id)
                     .bind(&delegation.participant_address).bind(&delegation.operational_signing_key)
                     .bind(&delegation.encryption_key).bind(value)
+                    .bind(can_read).bind(can_write)
                     .bind(delegation.not_before_ms).bind(delegation.expires_at_ms).execute(pool).await?.rows_affected()
             }
         };
@@ -355,20 +375,47 @@ impl Database {
     ) -> Result<AuthenticatedSession> {
         match self {
             Self::Sqlite(pool) => {
-                let row = sqlx::query("SELECT s.tenant_id, s.conversation_id, s.participant_address, s.delegation_id, s.expires_at_ms FROM sessions s JOIN delegations d ON d.id = s.delegation_id WHERE s.token_hash = ? AND s.expires_at_ms > ? AND d.expires_at_ms > ? AND d.revoked_at_ms IS NULL")
+                let row = sqlx::query("SELECT s.tenant_id, s.conversation_id, s.participant_address, s.delegation_id, s.expires_at_ms, d.operational_signing_key, d.can_read, d.can_write FROM sessions s JOIN delegations d ON d.id = s.delegation_id WHERE s.token_hash = ? AND s.expires_at_ms > ? AND d.expires_at_ms > ? AND d.revoked_at_ms IS NULL")
                     .bind(token_hash).bind(current_time_ms).bind(current_time_ms)
                     .fetch_optional(pool).await?
                     .ok_or_else(|| Error::Authentication("session is missing, expired, or revoked".to_string()))?;
                 session_from_sqlite(&row)
             }
             Self::Postgres(pool) => {
-                let row = sqlx::query("SELECT s.tenant_id, s.conversation_id, s.participant_address, s.delegation_id, s.expires_at_ms FROM sessions s JOIN delegations d ON d.id = s.delegation_id WHERE s.token_hash = $1 AND s.expires_at_ms > $2 AND d.expires_at_ms > $2 AND d.revoked_at_ms IS NULL")
+                let row = sqlx::query("SELECT s.tenant_id, s.conversation_id, s.participant_address, s.delegation_id, s.expires_at_ms, d.operational_signing_key, d.can_read, d.can_write FROM sessions s JOIN delegations d ON d.id = s.delegation_id WHERE s.token_hash = $1 AND s.expires_at_ms > $2 AND d.expires_at_ms > $2 AND d.revoked_at_ms IS NULL")
                     .bind(token_hash).bind(current_time_ms)
                     .fetch_optional(pool).await?
                     .ok_or_else(|| Error::Authentication("session is missing, expired, or revoked".to_string()))?;
                 session_from_postgres(&row)
             }
         }
+    }
+
+    pub async fn delegation_has_read_access(&self, id: Uuid, current_time_ms: i64) -> Result<()> {
+        let active = match self {
+            Self::Sqlite(pool) => {
+                sqlx::query_scalar::<_, i64>("SELECT 1 FROM delegations WHERE id = ? AND expires_at_ms > ? AND revoked_at_ms IS NULL AND can_read = 1")
+                    .bind(id.to_string())
+                    .bind(current_time_ms)
+                    .fetch_optional(pool)
+                    .await?
+                    .is_some()
+            }
+            Self::Postgres(pool) => {
+                sqlx::query_scalar::<_, i32>("SELECT 1 FROM delegations WHERE id = $1 AND expires_at_ms > $2 AND revoked_at_ms IS NULL AND can_read = TRUE")
+                    .bind(id.to_string())
+                    .bind(current_time_ms)
+                    .fetch_optional(pool)
+                    .await?
+                    .is_some()
+            }
+        };
+        if !active {
+            return Err(Error::Authentication(
+                "delegation is missing, expired, or revoked".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     pub async fn upsert_conversation(&self, conversation: &Conversation) -> Result<Conversation> {
@@ -623,6 +670,9 @@ fn session_from_sqlite(row: &SqliteRow) -> Result<AuthenticatedSession> {
         conversation_id: row.try_get("conversation_id")?,
         participant_address: row.try_get("participant_address")?,
         delegation_id: parse_uuid(row.try_get("delegation_id")?, "delegation ID")?,
+        operational_signing_key: row.try_get("operational_signing_key")?,
+        can_read: row.try_get("can_read")?,
+        can_write: row.try_get("can_write")?,
         expires_at_ms: row.try_get("expires_at_ms")?,
     })
 }
@@ -633,6 +683,9 @@ fn session_from_postgres(row: &PgRow) -> Result<AuthenticatedSession> {
         conversation_id: row.try_get("conversation_id")?,
         participant_address: row.try_get("participant_address")?,
         delegation_id: parse_uuid(row.try_get("delegation_id")?, "delegation ID")?,
+        operational_signing_key: row.try_get("operational_signing_key")?,
+        can_read: row.try_get("can_read")?,
+        can_write: row.try_get("can_write")?,
         expires_at_ms: row.try_get("expires_at_ms")?,
     })
 }

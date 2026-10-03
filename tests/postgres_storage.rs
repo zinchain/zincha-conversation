@@ -61,6 +61,9 @@ async fn postgres_atomic_session_and_concurrent_message_retry() {
         conversation_id: conversation_id.clone(),
         participant_address: participant.clone(),
         delegation_id: delegation.delegation_id,
+        operational_signing_key: delegation.operational_signing_key.clone(),
+        can_read: true,
+        can_write: true,
         expires_at_ms: now_ms() + 30_000,
     };
     database

@@ -230,5 +230,8 @@ pub struct AuthenticatedSession {
     pub conversation_id: String,
     pub participant_address: String,
     pub delegation_id: Uuid,
+    pub operational_signing_key: String,
+    pub can_read: bool,
+    pub can_write: bool,
     pub expires_at_ms: i64,
 }

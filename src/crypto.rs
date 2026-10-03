@@ -8,6 +8,7 @@ use chacha20poly1305::{
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use rand::{rngs::OsRng, RngCore};
 use sha2::{Digest, Sha256};
+use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::{
@@ -86,6 +87,17 @@ fn decode_hex<const N: usize>(value: &str, name: &str) -> Result<[u8; N]> {
     decoded
         .try_into()
         .map_err(|_| Error::Invalid(format!("{name} must be {N} bytes")))
+}
+
+fn validate_x25519_public_key(value: &str) -> Result<()> {
+    let public = X25519PublicKey::from(decode_hex::<32>(value, "encryption key")?);
+    let probe = StaticSecret::from([0x42; 32]);
+    if !probe.diffie_hellman(&public).was_contributory() {
+        return Err(Error::Invalid(
+            "encryption key is a non-contributory X25519 key".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 pub fn delegation_signing_bytes(delegation: &ConversationKeyDelegationV1) -> Vec<u8> {
@@ -186,7 +198,7 @@ pub fn verify_delegation(
         &delegation.operational_signing_key,
         "operational signing key",
     )?;
-    decode_hex::<32>(&delegation.encryption_key, "encryption key")?;
+    validate_x25519_public_key(&delegation.encryption_key)?;
     Ok(())
 }
 

@@ -7,7 +7,7 @@ use std::{
     },
 };
 
-use tokio::sync::{broadcast, Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{broadcast, Mutex, Notify, OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 
 use crate::{
@@ -33,7 +33,7 @@ pub struct ConversationService {
     authorization: Arc<dyn AuthorizationSource>,
     master_key: LocalMasterKey,
     streams: Arc<Mutex<HashMap<String, broadcast::Sender<MessageRecord>>>>,
-    refresh_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    refresh_flights: Arc<Mutex<HashMap<String, Arc<RefreshFlight>>>>,
     message_rate_limiter: Arc<RateLimiter>,
     challenge_address_rate_limiter: Arc<RateLimiter>,
     challenge_global_rate_limiter: Arc<RateLimiter>,
@@ -53,6 +53,33 @@ struct ServiceMetrics {
     sse_resyncs: AtomicU64,
     sse_authorization_closes: AtomicU64,
     maintenance_rows_removed: AtomicU64,
+    event_loop_lag_micros: AtomicU64,
+    event_loop_lag_max_micros: AtomicU64,
+}
+
+#[derive(Default)]
+struct RefreshFlight {
+    result: Mutex<Option<std::result::Result<Conversation, ()>>>,
+    completed: Notify,
+}
+
+impl RefreshFlight {
+    async fn wait(&self) -> Result<Conversation> {
+        let completed = self.completed.notified();
+        tokio::pin!(completed);
+        completed.as_mut().enable();
+        if self.result.lock().await.is_none() {
+            completed.await;
+        }
+        self.result
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| {
+                Error::Internal("authorization refresh completed without a result".to_string())
+            })?
+            .map_err(|()| Error::Unavailable("authorization refresh failed".to_string()))
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -171,7 +198,7 @@ impl ConversationService {
             authorization,
             master_key,
             streams: Arc::new(Mutex::new(HashMap::new())),
-            refresh_locks: Arc::new(Mutex::new(HashMap::new())),
+            refresh_flights: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -183,6 +210,7 @@ impl ConversationService {
         self.migrate().await?;
         self.db.ping().await?;
         self.spawn_maintenance();
+        self.spawn_event_loop_monitor();
         let listener = tokio::net::TcpListener::bind(self.config.listen)
             .await
             .map_err(|error| Error::Internal(format!("bind {}: {error}", self.config.listen)))?;
@@ -267,6 +295,17 @@ impl ConversationService {
             conversation_id: conversation_id.clone(),
             participant_address: challenge.participant_address,
             delegation_id: request.delegation.delegation_id,
+            operational_signing_key: request.delegation.operational_signing_key.clone(),
+            can_read: request
+                .delegation
+                .capabilities
+                .iter()
+                .any(|capability| capability == "read"),
+            can_write: request
+                .delegation
+                .capabilities
+                .iter()
+                .any(|capability| capability == "write"),
             expires_at_ms: configured_expiry.min(request.delegation.expires_at_ms),
         };
         let token = random_token();
@@ -372,47 +411,9 @@ impl ConversationService {
         let max_staleness =
             (self.config.limits.authorization_max_staleness_secs as i64).saturating_mul(1_000);
         if current.saturating_sub(conversation.snapshot.observed_at_ms) >= max_staleness {
-            let refresh_lock = {
-                let mut locks = self.refresh_locks.lock().await;
-                locks
-                    .entry(conversation_id.to_string())
-                    .or_insert_with(|| Arc::new(Mutex::new(())))
-                    .clone()
-            };
-            let refresh_result: Result<()> = async {
-                let _guard = refresh_lock.lock().await;
-                conversation = self
-                    .db
-                    .get_conversation(conversation_id)
-                    .await?
-                    .ok_or_else(|| Error::NotFound("conversation not found".to_string()))?;
-                let refreshed_at = now_ms();
-                if refreshed_at.saturating_sub(conversation.snapshot.observed_at_ms)
-                    >= max_staleness
-                {
-                    let snapshot = self
-                        .refresh_authorization(
-                            &conversation.subject,
-                            &conversation.snapshot.provider,
-                        )
-                        .await?;
-                    conversation.snapshot = snapshot;
-                    conversation.updated_at_ms = refreshed_at;
-                    conversation = self.db.upsert_conversation(&conversation).await?;
-                }
-                Ok(())
-            }
-            .await;
-            let mut locks = self.refresh_locks.lock().await;
-            if Arc::strong_count(&refresh_lock) == 2
-                && locks
-                    .get(conversation_id)
-                    .is_some_and(|entry| Arc::ptr_eq(entry, &refresh_lock))
-            {
-                locks.remove(conversation_id);
-            }
-            drop(locks);
-            refresh_result?;
+            conversation = self
+                .refresh_conversation_singleflight(conversation_id, max_staleness)
+                .await?;
         }
         require_participant(
             &conversation.snapshot,
@@ -420,21 +421,94 @@ impl ConversationService {
             require_write,
             now_ms(),
         )?;
-        let delegation = self.db.get_delegation(session.delegation_id).await?;
         let required = if require_write { "write" } else { "read" };
-        if delegation.revoked_at_ms.is_some()
-            || delegation.conversation_id != conversation.id
-            || !delegation
-                .delegation
-                .capabilities
-                .iter()
-                .any(|capability| capability == required)
-        {
+        if (require_write && !session.can_write) || (!require_write && !session.can_read) {
             return Err(Error::Forbidden(format!(
                 "delegation does not include {required} capability"
             )));
         }
         Ok(conversation)
+    }
+
+    async fn refresh_conversation_singleflight(
+        &self,
+        conversation_id: &str,
+        max_staleness_ms: i64,
+    ) -> Result<Conversation> {
+        let (flight, leader) = {
+            let mut flights = self.refresh_flights.lock().await;
+            if let Some(flight) = flights.get(conversation_id) {
+                (flight.clone(), false)
+            } else {
+                let flight = Arc::new(RefreshFlight::default());
+                flights.insert(conversation_id.to_string(), flight.clone());
+                (flight, true)
+            }
+        };
+        if leader {
+            let service = self.clone();
+            let conversation_id = conversation_id.to_string();
+            let flight = flight.clone();
+            tokio::spawn(async move {
+                let result = service
+                    .refresh_conversation_from_storage(&conversation_id, max_staleness_ms)
+                    .await;
+                *flight.result.lock().await = Some(match result {
+                    Ok(conversation) => Ok(conversation),
+                    Err(error) => {
+                        tracing::warn!(%error, %conversation_id, "authorization refresh failed");
+                        Err(())
+                    }
+                });
+                flight.completed.notify_waiters();
+                let mut flights = service.refresh_flights.lock().await;
+                if flights
+                    .get(&conversation_id)
+                    .is_some_and(|current| Arc::ptr_eq(current, &flight))
+                {
+                    flights.remove(&conversation_id);
+                }
+            });
+        }
+        flight.wait().await
+    }
+
+    async fn refresh_conversation_from_storage(
+        &self,
+        conversation_id: &str,
+        max_staleness_ms: i64,
+    ) -> Result<Conversation> {
+        let mut conversation = self
+            .db
+            .get_conversation(conversation_id)
+            .await?
+            .ok_or_else(|| Error::NotFound("conversation not found".to_string()))?;
+        let refreshed_at = now_ms();
+        if refreshed_at.saturating_sub(conversation.snapshot.observed_at_ms) >= max_staleness_ms {
+            let snapshot = self
+                .refresh_authorization(&conversation.subject, &conversation.snapshot.provider)
+                .await?;
+            conversation.snapshot = snapshot;
+            conversation.updated_at_ms = refreshed_at;
+            conversation = self.db.upsert_conversation(&conversation).await?;
+        }
+        Ok(conversation)
+    }
+
+    pub async fn revalidate_stream_session(
+        &self,
+        session: &AuthenticatedSession,
+        conversation_id: &str,
+    ) -> Result<()> {
+        let current = now_ms();
+        if current >= session.expires_at_ms {
+            return Err(Error::Authentication("session has expired".to_string()));
+        }
+        self.db
+            .delegation_has_read_access(session.delegation_id, current)
+            .await?;
+        self.conversation(session, conversation_id, false).await?;
+        Ok(())
     }
 
     pub async fn submit_message(
@@ -465,14 +539,13 @@ impl ConversationService {
             request.key_epoch,
         )?;
         let digest = payload_digest(&request.payload)?;
-        let delegation = self.db.get_delegation(session.delegation_id).await?;
-        if request.signing_key_id != delegation.delegation.delegation_id.to_string() {
+        if request.signing_key_id != session.delegation_id.to_string() {
             return Err(Error::Authentication(
                 "message signing key ID does not match the session delegation".to_string(),
             ));
         }
         verify_message_signature(
-            &delegation.delegation.operational_signing_key,
+            &session.operational_signing_key,
             conversation_id,
             &session.participant_address,
             &request,
@@ -664,7 +737,11 @@ impl ConversationService {
                 "# TYPE zincha_conversation_inflight_message_requests gauge\n",
                 "zincha_conversation_inflight_message_requests {}\n",
                 "# TYPE zincha_conversation_inflight_sse_replays gauge\n",
-                "zincha_conversation_inflight_sse_replays {}\n"
+                "zincha_conversation_inflight_sse_replays {}\n",
+                "# TYPE zincha_conversation_event_loop_lag_seconds gauge\n",
+                "zincha_conversation_event_loop_lag_seconds {:.6}\n",
+                "# TYPE zincha_conversation_event_loop_lag_max_seconds gauge\n",
+                "zincha_conversation_event_loop_lag_max_seconds {:.6}\n"
             ),
             metrics.messages_inserted.load(Ordering::Relaxed),
             metrics.message_retries.load(Ordering::Relaxed),
@@ -679,6 +756,8 @@ impl ConversationService {
             active_sse,
             inflight_messages,
             inflight_sse_replays,
+            metrics.event_loop_lag_micros.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+            metrics.event_loop_lag_max_micros.load(Ordering::Relaxed) as f64 / 1_000_000.0,
         )
     }
 
@@ -744,6 +823,27 @@ impl ConversationService {
                     }
                     Err(error) => tracing::warn!(%error, "retention cleanup failed"),
                 }
+            }
+        });
+    }
+
+    pub fn spawn_event_loop_monitor(&self) {
+        let metrics = self.metrics.clone();
+        tokio::spawn(async move {
+            let period = std::time::Duration::from_secs(1);
+            let mut interval =
+                tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                let scheduled = interval.tick().await;
+                let lag = tokio::time::Instant::now()
+                    .saturating_duration_since(scheduled)
+                    .as_micros()
+                    .min(u128::from(u64::MAX)) as u64;
+                metrics.event_loop_lag_micros.store(lag, Ordering::Relaxed);
+                metrics
+                    .event_loop_lag_max_micros
+                    .fetch_max(lag, Ordering::Relaxed);
             }
         });
     }

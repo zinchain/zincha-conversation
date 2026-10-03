@@ -59,6 +59,13 @@ the complete run. Put this private input in a mode-0600 file:
 }
 ```
 
+The qualification deployment must set
+`limits.messages_per_second_per_participant` to at least the declared offered
+rate because this driver intentionally measures one hot participant and one
+conversation. Record the override in the evidence manifest. Keep the secure
+production default unchanged for ordinary deployments, and do not interpret a
+rate-limit rejection as service capacity.
+
 The `delegation` value is the complete account-signed
 `ConversationKeyDelegationV1`. The driver refuses a pre-existing conversation,
 keeps response/error/sample memory bounded, rotates short-lived sessions, and
@@ -120,9 +127,11 @@ ordinary API requests remain responsive.
 
 During a sustained message run, record chain RPC requests. Refresh traffic must
 scale with active conversations divided by the configured authorization
-staleness interval, not with message rate. Change and revoke participant access
-on-chain and verify that the next bounded refresh closes affected streams and
-rejects reads/writes.
+staleness interval, not with message rate. Verify that concurrent stale
+requests for one conversation share a single chain refresh and that 10,000 SSE
+revalidation timers do not create synchronized database or chain-RPC bursts.
+Change and revoke participant access on-chain and verify that the next bounded
+refresh closes affected streams and rejects reads/writes.
 
 Age a terminal fixture beyond every configured horizon. Run bounded maintenance
 slices until no eligible rows remain. Verify message/event deletion, expired
