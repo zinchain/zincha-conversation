@@ -188,9 +188,7 @@ impl ConversationService {
             .map_err(|error| Error::Internal(format!("bind {}: {error}", self.config.listen)))?;
         tracing::info!(listen = %self.config.listen, service_id = %self.config.service.service_id, "conversation service ready");
         axum::serve(listener, crate::api::router(self.clone()))
-            .with_graceful_shutdown(async {
-                let _ = tokio::signal::ctrl_c().await;
-            })
+            .with_graceful_shutdown(shutdown_signal())
             .await
             .map_err(|error| Error::Internal(format!("serve conversation API: {error}")))
     }
@@ -837,6 +835,29 @@ impl ConversationService {
             signing_key_id: message.signing_key_id,
             signature: message.signature,
         })
+    }
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());
+        match terminate {
+            Ok(mut terminate) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = terminate.recv() => {}
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "failed to install SIGTERM handler; waiting for Ctrl-C");
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }
 

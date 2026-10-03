@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
-use zincha_conversation::{Config, ConversationService};
+use zincha_conversation::{storage::Database, Config, ConversationService};
 
 #[derive(Parser)]
 #[command(name = "zincha-conversation", version, about)]
@@ -42,10 +42,11 @@ async fn main() -> anyhow::Result<()> {
                 .await?
         }
         Command::Migrate { config } => {
-            ConversationService::from_config(Config::load(&config)?)
+            let config = Config::load(&config)?;
+            Database::connect(&config.database.url, config.database.max_connections)
                 .await?
                 .migrate()
-                .await?
+                .await?;
         }
         Command::Check { config } => {
             let config = Config::load(&config)?;
