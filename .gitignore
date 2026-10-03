@@ -1,0 +1,8 @@
+/target
+/conversation.toml
+/qualification-*.json
+/.env
+/*.db
+/*.db-*
+/*.sqlite
+/*.sqlite-*

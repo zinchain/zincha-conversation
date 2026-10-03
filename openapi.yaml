@@ -1,0 +1,473 @@
+openapi: 3.1.0
+info:
+  title: Zincha Conversation API
+  version: 1.0.0
+  description: Participant-authorized off-chain conversations for Zincha workflows.
+servers:
+  - url: https://conversations.example.com
+paths:
+  /healthz:
+    get:
+      operationId: conversationHealth
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+  /readyz:
+    get:
+      operationId: conversationReadiness
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "500": { $ref: "#/components/responses/Error" }
+  /metrics:
+    get:
+      operationId: conversationMetrics
+      summary: Bounded Prometheus metrics for service operations
+      responses:
+        "200":
+          description: Prometheus text exposition
+          content:
+            text/plain:
+              schema:
+                type: string
+  /v1/profile:
+    get:
+      operationId: getConversationProfile
+      responses:
+        "200":
+          description: Service profile
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ProfileResponse" }
+  /v1/auth/challenges:
+    post:
+      operationId: createConversationChallenge
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ChallengeRequest" }
+      responses:
+        "201":
+          description: Challenge issued
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ChallengeResponseEnvelope" }
+        "400": { $ref: "#/components/responses/Error" }
+        "429": { $ref: "#/components/responses/Error" }
+  /v1/auth/sessions:
+    post:
+      operationId: createConversationSession
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SessionRequest" }
+      responses:
+        "201":
+          description: Session created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SessionResponseEnvelope" }
+        "401": { $ref: "#/components/responses/Error" }
+  /v1/auth/delegations/{delegation_id}:
+    delete:
+      operationId: revokeConversationDelegation
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/DelegationId"
+      responses:
+        "204": { description: Delegation revoked }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+  /v1/conversations/resolve:
+    post:
+      operationId: resolveConversation
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ResolveConversationRequest" }
+      responses:
+        "200":
+          description: Deterministic conversation
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ConversationResponse" }
+        "403": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
+  /v1/conversations/{conversation_id}:
+    get:
+      operationId: getConversation
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/ConversationId"
+      responses:
+        "200":
+          description: Authorized conversation
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ConversationResponse" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+  /v1/conversations/{conversation_id}/messages:
+    get:
+      operationId: listConversationMessages
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/ConversationId"
+        - name: after
+          in: query
+          schema: { type: integer, format: int64, minimum: 0, default: 0 }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
+      responses:
+        "200":
+          description: Cursor-paged messages
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MessagePageResponse" }
+    post:
+      operationId: submitConversationMessage
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/ConversationId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SubmitMessageRequest" }
+      responses:
+        "201":
+          description: Inserted or idempotently recovered message
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MessageResponse" }
+        "409": { $ref: "#/components/responses/Error" }
+        "429": { $ref: "#/components/responses/Error" }
+  /v1/conversations/{conversation_id}/acknowledgements:
+    post:
+      operationId: acknowledgeConversationMessages
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/ConversationId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [through_sequence]
+              properties:
+                through_sequence: { type: integer, format: int64, minimum: 0 }
+      responses:
+        "204": { description: Acknowledgement advanced monotonically }
+  /v1/conversations/{conversation_id}/events:
+    get:
+      operationId: streamConversationEvents
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/ConversationId"
+        - name: after
+          in: query
+          schema: { type: integer, format: int64, minimum: 0, default: 0 }
+        - name: limit
+          in: query
+          description: Initial SSE replay is capped at 100; use paged reads for larger catch-up.
+          schema: { type: integer, minimum: 1, maximum: 100, default: 100 }
+      responses:
+        "200":
+          description: "`message` events, terminal `resync_required`, or terminal `authorization_required` when the session expires or chain-derived access can no longer be confirmed."
+          content:
+            text/event-stream:
+              schema: { type: string }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "429": { $ref: "#/components/responses/Error" }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  parameters:
+    ConversationId:
+      name: conversation_id
+      in: path
+      required: true
+      schema: { type: string, pattern: "^[0-9a-f]{64}$" }
+    DelegationId:
+      name: delegation_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+  responses:
+    Success:
+      description: Success
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/SuccessEnvelope" }
+    Error:
+      description: Error
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+  schemas:
+    SuccessEnvelope:
+      type: object
+      required: [success, data]
+      properties:
+        success: { const: true }
+        data: {}
+    ErrorEnvelope:
+      type: object
+      additionalProperties: false
+      required: [success, error, code]
+      properties:
+        success: { const: false }
+        error: { type: string }
+        code: { type: string }
+    SubjectRef:
+      type: object
+      additionalProperties: false
+      required: [network, chain_id, kind, id]
+      properties:
+        network: { type: string, minLength: 1, maxLength: 64 }
+        chain_id: { type: string, minLength: 1, maxLength: 128 }
+        kind: { enum: [task, agreement, tool_job, tool_session] }
+        id: { type: string, pattern: "^[0-9a-f]{64}$" }
+    ConversationProfile:
+      type: object
+      additionalProperties: false
+      required: [version, service_id, discovery_url, privacy_modes, protocol_versions, service_signing_public_key]
+      properties:
+        version: { const: 1 }
+        service_id: { type: string, minLength: 1, maxLength: 256 }
+        discovery_url: { type: string, format: uri, maxLength: 2048 }
+        privacy_modes:
+          type: array
+          minItems: 1
+          maxItems: 2
+          uniqueItems: true
+          items: { enum: [platform_readable, end_to_end] }
+        protocol_versions:
+          type: array
+          minItems: 1
+          maxItems: 64
+          uniqueItems: true
+          items: { type: integer, minimum: 1 }
+        service_signing_public_key: { type: string, pattern: "^[0-9a-f]{64}$" }
+    ProfileResponse:
+      allOf:
+        - $ref: "#/components/schemas/SuccessEnvelope"
+        - type: object
+          properties:
+            data: { $ref: "#/components/schemas/ConversationProfile" }
+    ChallengeRequest:
+      type: object
+      additionalProperties: false
+      required: [participant_address, subject]
+      properties:
+        participant_address: { type: string, pattern: "^zn1[0-9a-f]{40}$" }
+        subject: { $ref: "#/components/schemas/SubjectRef" }
+    Challenge:
+      type: object
+      required: [challenge_id, challenge, expires_at_ms]
+      properties:
+        challenge_id: { type: string, format: uuid }
+        challenge: { type: string }
+        expires_at_ms: { type: integer, format: int64 }
+    ChallengeResponseEnvelope:
+      allOf:
+        - $ref: "#/components/schemas/SuccessEnvelope"
+        - type: object
+          properties:
+            data: { $ref: "#/components/schemas/Challenge" }
+    Delegation:
+      type: object
+      additionalProperties: false
+      required: [version, delegation_id, participant_address, participant_public_key, subject, home_service_id, operational_signing_key, encryption_key, capabilities, not_before_ms, expires_at_ms, nonce, signature]
+      properties:
+        version: { const: 1 }
+        delegation_id: { type: string, format: uuid }
+        participant_address: { type: string, pattern: "^zn1[0-9a-f]{40}$" }
+        participant_public_key: { type: string, pattern: "^[0-9a-f]{64}$" }
+        subject: { $ref: "#/components/schemas/SubjectRef" }
+        home_service_id: { type: string }
+        operational_signing_key: { type: string, pattern: "^[0-9a-f]{64}$" }
+        encryption_key: { type: string, pattern: "^[0-9a-f]{64}$" }
+        capabilities:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items: { enum: [read, write] }
+        not_before_ms: { type: integer, format: int64 }
+        expires_at_ms: { type: integer, format: int64 }
+        nonce: { type: string, pattern: "^[0-9a-f]{32}$" }
+        signature: { type: string, pattern: "^[0-9a-f]{128}$" }
+    SessionRequest:
+      type: object
+      additionalProperties: false
+      required: [challenge_id, delegation, challenge_signature]
+      properties:
+        challenge_id: { type: string, format: uuid }
+        delegation: { $ref: "#/components/schemas/Delegation" }
+        challenge_signature: { type: string, pattern: "^[0-9a-f]{128}$" }
+    SessionResponseEnvelope:
+      allOf:
+        - $ref: "#/components/schemas/SuccessEnvelope"
+        - type: object
+          properties:
+            data:
+              type: object
+              required: [access_token, expires_at_ms]
+              properties:
+                access_token: { type: string }
+                expires_at_ms: { type: integer, format: int64 }
+    ResolveConversationRequest:
+      type: object
+      additionalProperties: false
+      required: [subject, provider_address, privacy_mode]
+      properties:
+        subject: { $ref: "#/components/schemas/SubjectRef" }
+        provider_address: { type: string, pattern: "^zn1[0-9a-f]{40}$" }
+        privacy_mode: { enum: [platform_readable, end_to_end] }
+    Conversation:
+      type: object
+      required: [id, tenant_id, subject, home_service_id, privacy_mode, snapshot, created_at_ms, updated_at_ms]
+      properties:
+        id: { type: string, pattern: "^[0-9a-f]{64}$" }
+        tenant_id: { type: string }
+        subject: { $ref: "#/components/schemas/SubjectRef" }
+        home_service_id: { type: string }
+        privacy_mode: { enum: [platform_readable, end_to_end] }
+        snapshot: { $ref: "#/components/schemas/SubjectSnapshot" }
+        created_at_ms: { type: integer, format: int64 }
+        updated_at_ms: { type: integer, format: int64 }
+    ConversationResponse:
+      allOf:
+        - $ref: "#/components/schemas/SuccessEnvelope"
+        - type: object
+          properties:
+            data: { $ref: "#/components/schemas/Conversation" }
+    Participant:
+      type: object
+      additionalProperties: false
+      required: [address, roles, can_read, can_write]
+      properties:
+        address: { type: string, pattern: "^zn1[0-9a-f]{40}$" }
+        roles:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items: { enum: [requester, provider, party, proposer, arbitrator, resolver] }
+        can_read: { type: boolean }
+        can_write: { type: boolean }
+    SubjectSnapshot:
+      type: object
+      additionalProperties: false
+      required: [subject, status, provider, participants, terminal_at_ms, write_until_ms, lifecycle_seq, observed_height, observed_block_hash, observed_at_ms, digest]
+      properties:
+        subject: { $ref: "#/components/schemas/SubjectRef" }
+        status: { type: string }
+        provider: { type: string, pattern: "^zn1[0-9a-f]{40}$" }
+        participants:
+          type: array
+          minItems: 1
+          items: { $ref: "#/components/schemas/Participant" }
+        terminal_at_ms: { type: [integer, "null"], format: int64 }
+        write_until_ms: { type: [integer, "null"], format: int64 }
+        lifecycle_seq: { type: [integer, "null"], format: int64, minimum: 0 }
+        observed_height: { type: integer, format: uint64, minimum: 0 }
+        observed_block_hash: { type: string, pattern: "^[0-9a-f]{64}$" }
+        observed_at_ms: { type: integer, format: int64 }
+        digest: { type: string, pattern: "^[0-9a-f]{64}$" }
+    MessagePart:
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required: [type, text]
+          properties:
+            type: { const: text }
+            text: { type: string }
+        - type: object
+          additionalProperties: false
+          required: [type, value]
+          properties:
+            type: { const: data }
+            value: {}
+        - type: object
+          additionalProperties: false
+          required: [type, artifact_id, digest, media_type, size]
+          properties:
+            type: { const: artifact_reference }
+            artifact_id: { type: string, format: uuid }
+            digest: { type: string, pattern: "^[0-9a-f]{64}$" }
+            media_type: { type: string, minLength: 1, maxLength: 255 }
+            size: { type: integer, format: uint64, minimum: 0 }
+    MessagePayload:
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required: [encoding, parts]
+          properties:
+            encoding: { const: plaintext }
+            parts:
+              type: array
+              minItems: 1
+              maxItems: 256
+              items: { $ref: "#/components/schemas/MessagePart" }
+        - type: object
+          additionalProperties: false
+          required: [encoding, ciphertext]
+          properties:
+            encoding: { const: ciphertext }
+            ciphertext: { type: string, pattern: "^[A-Za-z0-9_-]+$" }
+    SubmitMessageRequest:
+      type: object
+      additionalProperties: false
+      required: [message_id, client_timestamp_ms, payload, signing_key_id, signature]
+      properties:
+        message_id: { type: string, format: uuid }
+        client_timestamp_ms: { type: integer, format: int64 }
+        reply_to: { type: [string, "null"], format: uuid }
+        key_epoch: { type: [integer, "null"], format: int64, minimum: 0, maximum: 9223372036854775807 }
+        payload: { $ref: "#/components/schemas/MessagePayload" }
+        signing_key_id: { type: string, format: uuid }
+        signature: { type: string, pattern: "^[0-9a-f]{128}$" }
+    Message:
+      type: object
+      additionalProperties: false
+      required: [conversation_id, sequence, message_id, sender, client_timestamp_ms, accepted_at_ms, payload, payload_digest, signing_key_id, signature]
+      properties:
+        conversation_id: { type: string, pattern: "^[0-9a-f]{64}$" }
+        sequence: { type: integer, format: int64, minimum: 1 }
+        message_id: { type: string, format: uuid }
+        sender: { type: string, pattern: "^zn1[0-9a-f]{40}$" }
+        client_timestamp_ms: { type: integer, format: int64 }
+        accepted_at_ms: { type: integer, format: int64 }
+        reply_to: { type: [string, "null"], format: uuid }
+        key_epoch: { type: [integer, "null"], format: int64, minimum: 0, maximum: 9223372036854775807 }
+        payload: { $ref: "#/components/schemas/MessagePayload" }
+        payload_digest: { type: string, pattern: "^[0-9a-f]{64}$" }
+        signing_key_id: { type: string, format: uuid }
+        signature: { type: string, pattern: "^[0-9a-f]{128}$" }
+    MessageResponse:
+      allOf:
+        - $ref: "#/components/schemas/SuccessEnvelope"
+        - type: object
+          properties:
+            data: { $ref: "#/components/schemas/Message" }
+    MessagePageResponse:
+      allOf:
+        - $ref: "#/components/schemas/SuccessEnvelope"
+        - type: object
+          properties:
+            data:
+              type: object
+              required: [items, next_cursor]
+              properties:
+                items:
+                  type: array
+                  items: { $ref: "#/components/schemas/Message" }
+                next_cursor: { type: [integer, "null"], format: int64 }

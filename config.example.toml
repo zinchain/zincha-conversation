@@ -1,0 +1,62 @@
+listen = "127.0.0.1:9988"
+
+[service]
+service_id = "marketplace.example/conversations"
+public_url = "https://conversations.marketplace.example"
+tenant_id = "marketplace-example"
+service_signing_public_key = "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c"
+privacy_modes = ["platform_readable", "end_to_end"]
+allowed_origins = ["https://marketplace.example"]
+
+[database]
+# Use PostgreSQL for multi-instance production deployments. SQLite WAL mode is
+# supported for a single provider process or local agent runtime.
+url = "postgres://zincha_conversation@127.0.0.1/zincha_conversation"
+max_connections = 20
+
+[chain]
+rpc_url = "https://rpc.example.zincha.com"
+network = "mainnet"
+chain_id = "zincha-mainnet-1"
+
+# A conversation service reads private workflow records as the workflow's
+# provider. The address key must match the configured signer exactly.
+[chain.provider_signers."zn10000000000000000000000000000000000000001"]
+type = "external"
+url = "http://127.0.0.1:9910"
+bearer_token_file = "/run/secrets/zincha-provider-signer-token"
+
+[encryption]
+# Exactly 32 random bytes encoded as 64 hex characters. Mount this from a
+# secret manager; do not store the key beside the database or its backups.
+local_master_key_file = "/run/secrets/zincha-conversation-master-key"
+
+[retention]
+# Retention is intentionally operator-required. There are no silent defaults.
+messages_after_terminal_secs = 2592000
+# These two values declare policies enforced by the external artifact store and
+# backup system. Keep them in the same reviewed deployment manifest; this
+# daemon never receives artifact bytes and cannot delete database backups.
+artifacts_after_terminal_secs = 604800
+audit_secs = 7776000
+backups_secs = 7776000
+
+[limits]
+challenge_ttl_secs = 300
+session_ttl_secs = 900
+authorization_max_staleness_secs = 60
+terminal_write_grace_secs = 604800
+max_request_body_bytes = 65536
+max_message_page_size = 500
+messages_per_second_per_participant = 100
+challenges_per_minute_per_address = 10
+challenges_per_second_global = 100
+max_inflight_messages = 256
+sse_buffer_messages = 256
+max_sse_connections = 10000
+# Caps simultaneous database replay/catch-up work independently of idle streams.
+max_inflight_sse_replays = 64
+max_concurrent_requests = 4096
+maintenance_interval_ms = 1000
+maintenance_batch_rows = 5000
+message_clock_skew_secs = 600

@@ -1,0 +1,26 @@
+{
+  "conversation_id": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+  "epoch": 7,
+  "recipient_key_id": "recipient-v1",
+  "recipient_secret_hex": "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+  "plaintext": {
+    "encoding": "plaintext",
+    "parts": [
+      {
+        "type": "text",
+        "text": "Cross-language hello"
+      },
+      {
+        "type": "data",
+        "value": {
+          "amount": 42,
+          "ok": true
+        }
+      }
+    ]
+  },
+  "payload": {
+    "encoding": "ciphertext",
+    "ciphertext": "eyJjaXBoZXJ0ZXh0IjoiajM4TUZVMjJqWWloZDdib013d3hWRzFjMDRsM1BhNGNzZE9OdG5pRnlyQ2g4Y1JxYWJfWGhqM21yUXJ0cm9pc1lJOWNRQk5wb2ZvUjlZNXBrMGZyZDFNcGZtb19iTFo3aTF1d1MxbGxON2o4a1ptaHloY1NNeUhDbXN5SzNhSzljd0RkSHloTGZPaVd5SzhjMVpLc1JaUG8ySHczSVRlZmdGeUhjaUFKYVFISnhGd2dPRWtqNE5RVmQtSjhHd19lIiwiY29udGVudF9ub25jZSI6Im1rQnhBeTBEeXZoRDMtajdZSnRmSUR4eHFxTHNQMGRHIiwiZXBoZW1lcmFsX3B1YmxpY19rZXkiOiI2ZDMwNzIxZjhjMTFjYWY1NDQwZmM4Zjg3YTIxNjcyYzk1ZmQ0ZWI3MjNlNjU4M2U1NjQ4MTRmYmQ2NzNlYzE0IiwiZXBvY2giOjcsInJlY2lwaWVudHMiOlt7ImNpcGhlcnRleHQiOiJQVm95eHFzZjVJMlY0TE1WTFN1YlVLbGk0QV92QTA5bFAwRDFiMm1YVXBaTUJZZzhsWThmSjAxbE44QWsxV2RmIiwia2V5X2lkIjoicmVjaXBpZW50LXYxIiwibm9uY2UiOiJob0F0eHozMk5TeVlMLXBiNG5QamUwNnN0OXRDbG9oSyJ9XSwidmVyc2lvbiI6MX0"
+  }
+}

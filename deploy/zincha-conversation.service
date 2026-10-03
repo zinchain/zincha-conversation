@@ -1,0 +1,23 @@
+[Unit]
+Description=Zincha participant conversation service
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=zincha-conversation
+Group=zincha-conversation
+ExecStart=/usr/local/bin/zincha-conversation serve --config /etc/zincha/conversation.toml
+Restart=on-failure
+RestartSec=2
+Environment=RUST_LOG=zincha_conversation=info,tower_http=info
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/zincha-conversation
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+

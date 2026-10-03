@@ -1,0 +1,1025 @@
+use std::{
+    collections::{hash_map::RandomState, HashMap},
+    hash::BuildHasher,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+};
+
+use tokio::sync::{broadcast, Mutex, OwnedSemaphorePermit, Semaphore};
+use uuid::Uuid;
+
+use crate::{
+    chain::{AuthorizationSource, ChainClient},
+    config::Config,
+    crypto::{
+        now_ms, payload_digest, random_token, sha256_hex, token_hash, verify_challenge_signature,
+        verify_delegation, verify_message_signature, LocalMasterKey,
+    },
+    error::{Error, Result},
+    model::{
+        AuthenticatedSession, ChallengeRequest, ChallengeResponse, Conversation, MessagePayload,
+        MessageRecord, Page, PrivacyMode, ResolveConversationRequest, SessionRequest,
+        SessionResponse, SubjectRef, SubjectSnapshot, SubmitMessageRequest,
+    },
+    storage::{Database, InsertMessageOutcome, NewMessage, StoredChallenge, StoredMessage},
+};
+
+#[derive(Clone)]
+pub struct ConversationService {
+    pub config: Arc<Config>,
+    pub db: Database,
+    authorization: Arc<dyn AuthorizationSource>,
+    master_key: LocalMasterKey,
+    streams: Arc<Mutex<HashMap<String, broadcast::Sender<MessageRecord>>>>,
+    refresh_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    message_rate_limiter: Arc<RateLimiter>,
+    challenge_address_rate_limiter: Arc<RateLimiter>,
+    challenge_global_rate_limiter: Arc<RateLimiter>,
+    message_permits: Arc<Semaphore>,
+    sse_permits: Arc<Semaphore>,
+    sse_replay_permits: Arc<Semaphore>,
+    metrics: Arc<ServiceMetrics>,
+}
+
+#[derive(Default)]
+struct ServiceMetrics {
+    messages_inserted: AtomicU64,
+    message_retries: AtomicU64,
+    message_insert_micros: AtomicU64,
+    authorization_refreshes: AtomicU64,
+    authorization_refresh_failures: AtomicU64,
+    sse_resyncs: AtomicU64,
+    sse_authorization_closes: AtomicU64,
+    maintenance_rows_removed: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RateWindow {
+    bucket: i64,
+    count: u32,
+}
+
+struct RateLimiter {
+    limit: u32,
+    window_ms: i64,
+    rejection_message: &'static str,
+    hash_builder: RandomState,
+    shards: Box<[Mutex<HashMap<String, RateWindow>>]>,
+    max_entries_per_shard: usize,
+}
+
+impl RateLimiter {
+    const SHARD_COUNT: usize = 64;
+    const MAX_ENTRIES: usize = 100_000;
+
+    fn new(limit: u32, window_ms: i64, rejection_message: &'static str) -> Self {
+        Self {
+            limit,
+            window_ms,
+            rejection_message,
+            hash_builder: RandomState::new(),
+            shards: (0..Self::SHARD_COUNT)
+                .map(|_| Mutex::new(HashMap::new()))
+                .collect(),
+            max_entries_per_shard: Self::MAX_ENTRIES.div_ceil(Self::SHARD_COUNT),
+        }
+    }
+
+    async fn check(&self, key: &str, timestamp_ms: i64) -> Result<()> {
+        let bucket = timestamp_ms / self.window_ms;
+        let shard_index = (self.hash_builder.hash_one(key) as usize) % self.shards.len();
+        let mut windows = self.shards[shard_index].lock().await;
+        if windows.len() >= self.max_entries_per_shard && !windows.contains_key(key) {
+            windows.retain(|_, window| window.bucket >= bucket - 1);
+            if windows.len() >= self.max_entries_per_shard {
+                return Err(Error::RateLimited(self.rejection_message.to_string()));
+            }
+        }
+        let window = windows
+            .entry(key.to_string())
+            .or_insert(RateWindow { bucket, count: 0 });
+        if window.bucket != bucket {
+            *window = RateWindow { bucket, count: 0 };
+        }
+        if window.count >= self.limit {
+            return Err(Error::RateLimited(self.rejection_message.to_string()));
+        }
+        window.count += 1;
+        Ok(())
+    }
+
+    async fn cleanup(&self, timestamp_ms: i64) {
+        let bucket = timestamp_ms / self.window_ms;
+        for shard in &self.shards {
+            shard
+                .lock()
+                .await
+                .retain(|_, window| window.bucket >= bucket - 1);
+        }
+    }
+
+    #[cfg(test)]
+    async fn entry_count(&self) -> usize {
+        let mut count = 0;
+        for shard in &self.shards {
+            count += shard.lock().await.len();
+        }
+        count
+    }
+}
+
+impl ConversationService {
+    pub async fn from_config(config: Config) -> Result<Self> {
+        config.validate()?;
+        let db = Database::connect(&config.database.url, config.database.max_connections).await?;
+        let authorization = Arc::new(ChainClient::from_config(&config.chain).await?);
+        let master_key = LocalMasterKey::from_file(&config.encryption.local_master_key_file)?;
+        Self::new(config, db, authorization, master_key).await
+    }
+
+    pub async fn new(
+        config: Config,
+        db: Database,
+        authorization: Arc<dyn AuthorizationSource>,
+        master_key: LocalMasterKey,
+    ) -> Result<Self> {
+        config.validate()?;
+        Ok(Self {
+            message_rate_limiter: Arc::new(RateLimiter::new(
+                config.limits.messages_per_second_per_participant,
+                1_000,
+                "participant message rate exceeded",
+            )),
+            challenge_address_rate_limiter: Arc::new(RateLimiter::new(
+                config.limits.challenges_per_minute_per_address,
+                60_000,
+                "participant challenge rate exceeded",
+            )),
+            challenge_global_rate_limiter: Arc::new(RateLimiter::new(
+                config.limits.challenges_per_second_global,
+                1_000,
+                "global challenge rate exceeded",
+            )),
+            message_permits: Arc::new(Semaphore::new(config.limits.max_inflight_messages)),
+            sse_permits: Arc::new(Semaphore::new(config.limits.max_sse_connections)),
+            sse_replay_permits: Arc::new(Semaphore::new(config.limits.max_inflight_sse_replays)),
+            metrics: Arc::new(ServiceMetrics::default()),
+            config: Arc::new(config),
+            db,
+            authorization,
+            master_key,
+            streams: Arc::new(Mutex::new(HashMap::new())),
+            refresh_locks: Arc::new(Mutex::new(HashMap::new())),
+        })
+    }
+
+    pub async fn migrate(&self) -> Result<()> {
+        self.db.migrate().await
+    }
+
+    pub async fn serve(&self) -> Result<()> {
+        self.migrate().await?;
+        self.db.ping().await?;
+        self.spawn_maintenance();
+        let listener = tokio::net::TcpListener::bind(self.config.listen)
+            .await
+            .map_err(|error| Error::Internal(format!("bind {}: {error}", self.config.listen)))?;
+        tracing::info!(listen = %self.config.listen, service_id = %self.config.service.service_id, "conversation service ready");
+        axum::serve(listener, crate::api::router(self.clone()))
+            .with_graceful_shutdown(async {
+                let _ = tokio::signal::ctrl_c().await;
+            })
+            .await
+            .map_err(|error| Error::Internal(format!("serve conversation API: {error}")))
+    }
+
+    pub async fn issue_challenge(&self, request: ChallengeRequest) -> Result<ChallengeResponse> {
+        validate_address(&request.participant_address)?;
+        self.validate_subject(&request.subject)?;
+        let current = now_ms();
+        self.challenge_address_rate_limiter
+            .check(&request.participant_address, current)
+            .await?;
+        self.challenge_global_rate_limiter
+            .check("global", current)
+            .await?;
+        let challenge = StoredChallenge {
+            id: Uuid::now_v7(),
+            tenant_id: self.config.service.tenant_id.clone(),
+            participant_address: request.participant_address,
+            subject: request.subject,
+            challenge: random_token(),
+            expires_at_ms: current.saturating_add(
+                (self.config.limits.challenge_ttl_secs as i64).saturating_mul(1_000),
+            ),
+        };
+        self.db.create_challenge(&challenge).await?;
+        Ok(ChallengeResponse {
+            challenge_id: challenge.id,
+            challenge: challenge.challenge,
+            expires_at_ms: challenge.expires_at_ms,
+        })
+    }
+
+    pub async fn create_session(&self, request: SessionRequest) -> Result<SessionResponse> {
+        let current = now_ms();
+        let challenge = self
+            .db
+            .get_active_challenge(request.challenge_id, current)
+            .await?;
+        if challenge.participant_address != request.delegation.participant_address
+            || challenge.subject != request.delegation.subject
+        {
+            return Err(Error::Authentication(
+                "delegation does not match the challenge".to_string(),
+            ));
+        }
+        verify_delegation(
+            &request.delegation,
+            &self.config.service.service_id,
+            current,
+        )?;
+        verify_challenge_signature(
+            &request.delegation.operational_signing_key,
+            challenge.id,
+            &challenge.challenge,
+            &request.challenge_signature,
+        )?;
+        if !request
+            .delegation
+            .capabilities
+            .iter()
+            .any(|capability| capability == "read")
+        {
+            return Err(Error::Forbidden(
+                "delegation does not include read capability".to_string(),
+            ));
+        }
+        let conversation_id = conversation_id(
+            &challenge.tenant_id,
+            &self.config.service.service_id,
+            &challenge.subject,
+        )?;
+        let configured_expiry = current
+            .saturating_add((self.config.limits.session_ttl_secs as i64).saturating_mul(1_000));
+        let session = AuthenticatedSession {
+            tenant_id: challenge.tenant_id.clone(),
+            conversation_id: conversation_id.clone(),
+            participant_address: challenge.participant_address,
+            delegation_id: request.delegation.delegation_id,
+            expires_at_ms: configured_expiry.min(request.delegation.expires_at_ms),
+        };
+        let token = random_token();
+        self.db
+            .establish_session(
+                request.challenge_id,
+                current,
+                &request.delegation,
+                &session,
+                &token_hash(&token),
+            )
+            .await?;
+        Ok(SessionResponse {
+            access_token: token,
+            expires_at_ms: session.expires_at_ms,
+        })
+    }
+
+    pub async fn authenticate(&self, bearer_token: &str) -> Result<AuthenticatedSession> {
+        if bearer_token.is_empty() || bearer_token.len() > 256 {
+            return Err(Error::Authentication("invalid access token".to_string()));
+        }
+        self.db
+            .authenticate_session(&token_hash(bearer_token), now_ms())
+            .await
+    }
+
+    pub async fn resolve_conversation(
+        &self,
+        session: &AuthenticatedSession,
+        request: ResolveConversationRequest,
+    ) -> Result<Conversation> {
+        self.validate_subject(&request.subject)?;
+        validate_address(&request.provider_address)?;
+        let delegation = self.db.get_delegation(session.delegation_id).await?;
+        if delegation.revoked_at_ms.is_some()
+            || delegation.delegation.subject != request.subject
+            || delegation.conversation_id != session.conversation_id
+        {
+            return Err(Error::Forbidden(
+                "session delegation does not authorize this subject".to_string(),
+            ));
+        }
+        if !self
+            .config
+            .service
+            .privacy_modes
+            .contains(&request.privacy_mode)
+        {
+            return Err(Error::Invalid(
+                "requested privacy mode is not enabled".to_string(),
+            ));
+        }
+        let expected_id = conversation_id(
+            &session.tenant_id,
+            &self.config.service.service_id,
+            &request.subject,
+        )?;
+        if expected_id != session.conversation_id {
+            return Err(Error::Forbidden(
+                "session conversation binding is invalid".to_string(),
+            ));
+        }
+        let snapshot = self
+            .refresh_authorization(&request.subject, &request.provider_address)
+            .await?;
+        require_participant(&snapshot, &session.participant_address, false, now_ms())?;
+        let current = now_ms();
+        self.db
+            .upsert_conversation(&Conversation {
+                id: expected_id,
+                tenant_id: session.tenant_id.clone(),
+                subject: request.subject,
+                home_service_id: self.config.service.service_id.clone(),
+                privacy_mode: request.privacy_mode,
+                snapshot,
+                created_at_ms: current,
+                updated_at_ms: current,
+            })
+            .await
+    }
+
+    pub async fn conversation(
+        &self,
+        session: &AuthenticatedSession,
+        conversation_id: &str,
+        require_write: bool,
+    ) -> Result<Conversation> {
+        if session.conversation_id != conversation_id {
+            return Err(Error::Forbidden(
+                "session is scoped to another conversation".to_string(),
+            ));
+        }
+        let mut conversation = self
+            .db
+            .get_conversation(conversation_id)
+            .await?
+            .ok_or_else(|| Error::NotFound("conversation not found".to_string()))?;
+        if conversation.tenant_id != session.tenant_id {
+            return Err(Error::Forbidden("tenant mismatch".to_string()));
+        }
+        let current = now_ms();
+        let max_staleness =
+            (self.config.limits.authorization_max_staleness_secs as i64).saturating_mul(1_000);
+        if current.saturating_sub(conversation.snapshot.observed_at_ms) >= max_staleness {
+            let refresh_lock = {
+                let mut locks = self.refresh_locks.lock().await;
+                locks
+                    .entry(conversation_id.to_string())
+                    .or_insert_with(|| Arc::new(Mutex::new(())))
+                    .clone()
+            };
+            let refresh_result: Result<()> = async {
+                let _guard = refresh_lock.lock().await;
+                conversation = self
+                    .db
+                    .get_conversation(conversation_id)
+                    .await?
+                    .ok_or_else(|| Error::NotFound("conversation not found".to_string()))?;
+                let refreshed_at = now_ms();
+                if refreshed_at.saturating_sub(conversation.snapshot.observed_at_ms)
+                    >= max_staleness
+                {
+                    let snapshot = self
+                        .refresh_authorization(
+                            &conversation.subject,
+                            &conversation.snapshot.provider,
+                        )
+                        .await?;
+                    conversation.snapshot = snapshot;
+                    conversation.updated_at_ms = refreshed_at;
+                    conversation = self.db.upsert_conversation(&conversation).await?;
+                }
+                Ok(())
+            }
+            .await;
+            let mut locks = self.refresh_locks.lock().await;
+            if Arc::strong_count(&refresh_lock) == 2
+                && locks
+                    .get(conversation_id)
+                    .is_some_and(|entry| Arc::ptr_eq(entry, &refresh_lock))
+            {
+                locks.remove(conversation_id);
+            }
+            drop(locks);
+            refresh_result?;
+        }
+        require_participant(
+            &conversation.snapshot,
+            &session.participant_address,
+            require_write,
+            now_ms(),
+        )?;
+        let delegation = self.db.get_delegation(session.delegation_id).await?;
+        let required = if require_write { "write" } else { "read" };
+        if delegation.revoked_at_ms.is_some()
+            || delegation.conversation_id != conversation.id
+            || !delegation
+                .delegation
+                .capabilities
+                .iter()
+                .any(|capability| capability == required)
+        {
+            return Err(Error::Forbidden(format!(
+                "delegation does not include {required} capability"
+            )));
+        }
+        Ok(conversation)
+    }
+
+    pub async fn submit_message(
+        &self,
+        session: &AuthenticatedSession,
+        conversation_id: &str,
+        request: SubmitMessageRequest,
+    ) -> Result<MessageRecord> {
+        let _permit = self
+            .message_permits
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Error::RateLimited("message admission is saturated".to_string()))?;
+        let current = now_ms();
+        self.message_rate_limiter
+            .check(&session.participant_address, current)
+            .await?;
+        let conversation = self.conversation(session, conversation_id, true).await?;
+        let max_skew = (self.config.limits.message_clock_skew_secs as i64).saturating_mul(1_000);
+        if current.abs_diff(request.client_timestamp_ms) > max_skew as u64 {
+            return Err(Error::Invalid(
+                "message timestamp is outside the allowed clock skew".to_string(),
+            ));
+        }
+        validate_payload(
+            conversation.privacy_mode,
+            &request.payload,
+            request.key_epoch,
+        )?;
+        let digest = payload_digest(&request.payload)?;
+        let delegation = self.db.get_delegation(session.delegation_id).await?;
+        if request.signing_key_id != delegation.delegation.delegation_id.to_string() {
+            return Err(Error::Authentication(
+                "message signing key ID does not match the session delegation".to_string(),
+            ));
+        }
+        verify_message_signature(
+            &delegation.delegation.operational_signing_key,
+            conversation_id,
+            &session.participant_address,
+            &request,
+            &digest,
+        )?;
+        let serialized = serde_jcs::to_vec(&request.payload)
+            .map_err(|error| Error::Invalid(format!("payload cannot be encoded: {error}")))?;
+        let aad = payload_aad(conversation_id, request.message_id, &digest);
+        let payload_blob = match conversation.privacy_mode {
+            PrivacyMode::PlatformReadable => {
+                self.master_key.encrypt(aad.as_bytes(), &serialized)?
+            }
+            PrivacyMode::EndToEnd => serialized,
+        };
+        let insert_started = std::time::Instant::now();
+        let outcome = self
+            .db
+            .insert_message(&NewMessage {
+                conversation_id: conversation_id.to_string(),
+                message_id: request.message_id,
+                sender: session.participant_address.clone(),
+                client_timestamp_ms: request.client_timestamp_ms,
+                accepted_at_ms: current,
+                reply_to: request.reply_to,
+                key_epoch: request.key_epoch.map(|epoch| epoch as i64),
+                payload_blob,
+                payload_digest: digest,
+                signing_key_id: request.signing_key_id,
+                signature: request.signature,
+            })
+            .await?;
+        self.metrics.message_insert_micros.fetch_add(
+            insert_started
+                .elapsed()
+                .as_micros()
+                .min(u128::from(u64::MAX)) as u64,
+            Ordering::Relaxed,
+        );
+        let (stored, inserted) = match outcome {
+            InsertMessageOutcome::Inserted(message) => {
+                self.metrics
+                    .messages_inserted
+                    .fetch_add(1, Ordering::Relaxed);
+                (message, true)
+            }
+            InsertMessageOutcome::Existing(message) => {
+                self.metrics.message_retries.fetch_add(1, Ordering::Relaxed);
+                (message, false)
+            }
+        };
+        let record = self.decode_message(&conversation, stored)?;
+        if inserted {
+            if let Some(sender) = self.streams.lock().await.get(conversation_id).cloned() {
+                let _ = sender.send(record.clone());
+            }
+        }
+        Ok(record)
+    }
+
+    pub async fn list_messages(
+        &self,
+        session: &AuthenticatedSession,
+        conversation_id: &str,
+        after: i64,
+        requested_limit: u32,
+    ) -> Result<Page<MessageRecord>> {
+        if after < 0 {
+            return Err(Error::Invalid(
+                "message cursor cannot be negative".to_string(),
+            ));
+        }
+        let conversation = self.conversation(session, conversation_id, false).await?;
+        if requested_limit == 0 || requested_limit > self.config.limits.max_message_page_size {
+            return Err(Error::Invalid("message page limit is invalid".to_string()));
+        }
+        let limit = requested_limit;
+        let mut rows = self
+            .db
+            .list_messages(conversation_id, after, i64::from(limit) + 1)
+            .await?;
+        let has_more = rows.len() > limit as usize;
+        rows.truncate(limit as usize);
+        let items = rows
+            .into_iter()
+            .map(|row| self.decode_message(&conversation, row))
+            .collect::<Result<Vec<_>>>()?;
+        let next_cursor = has_more
+            .then(|| items.last().map(|message| message.sequence))
+            .flatten();
+        Ok(Page { items, next_cursor })
+    }
+
+    pub async fn acknowledge(
+        &self,
+        session: &AuthenticatedSession,
+        conversation_id: &str,
+        through_sequence: i64,
+    ) -> Result<()> {
+        if through_sequence < 0 {
+            return Err(Error::Invalid(
+                "acknowledgement sequence cannot be negative".to_string(),
+            ));
+        }
+        self.conversation(session, conversation_id, false).await?;
+        self.db
+            .acknowledge(
+                conversation_id,
+                &session.participant_address,
+                through_sequence,
+            )
+            .await
+    }
+
+    pub async fn subscribe(
+        &self,
+        session: &AuthenticatedSession,
+        conversation_id: &str,
+    ) -> Result<broadcast::Receiver<MessageRecord>> {
+        self.conversation(session, conversation_id, false).await?;
+        let mut streams = self.streams.lock().await;
+        streams.retain(|_, sender| sender.receiver_count() > 0);
+        let sender = streams
+            .entry(conversation_id.to_string())
+            .or_insert_with(|| broadcast::channel(self.config.limits.sse_buffer_messages).0);
+        Ok(sender.subscribe())
+    }
+
+    pub fn acquire_sse_permit(&self) -> Result<OwnedSemaphorePermit> {
+        self.sse_permits
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Error::RateLimited("SSE connection capacity is exhausted".to_string()))
+    }
+
+    pub fn acquire_sse_replay_permit(&self) -> Result<OwnedSemaphorePermit> {
+        self.sse_replay_permits
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Error::RateLimited("SSE replay capacity is exhausted".to_string()))
+    }
+
+    pub fn record_sse_resync(&self) {
+        self.metrics.sse_resyncs.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_sse_authorization_close(&self) {
+        self.metrics
+            .sse_authorization_closes
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn metrics_text(&self) -> String {
+        let metrics = &self.metrics;
+        let active_sse = self
+            .config
+            .limits
+            .max_sse_connections
+            .saturating_sub(self.sse_permits.available_permits());
+        let inflight_messages = self
+            .config
+            .limits
+            .max_inflight_messages
+            .saturating_sub(self.message_permits.available_permits());
+        let inflight_sse_replays = self
+            .config
+            .limits
+            .max_inflight_sse_replays
+            .saturating_sub(self.sse_replay_permits.available_permits());
+        format!(
+            concat!(
+                "# TYPE zincha_conversation_messages_inserted_total counter\n",
+                "zincha_conversation_messages_inserted_total {}\n",
+                "# TYPE zincha_conversation_message_retries_total counter\n",
+                "zincha_conversation_message_retries_total {}\n",
+                "# TYPE zincha_conversation_message_insert_seconds_total counter\n",
+                "zincha_conversation_message_insert_seconds_total {:.6}\n",
+                "# TYPE zincha_conversation_authorization_refreshes_total counter\n",
+                "zincha_conversation_authorization_refreshes_total {}\n",
+                "# TYPE zincha_conversation_authorization_refresh_failures_total counter\n",
+                "zincha_conversation_authorization_refresh_failures_total {}\n",
+                "# TYPE zincha_conversation_sse_resyncs_total counter\n",
+                "zincha_conversation_sse_resyncs_total {}\n",
+                "# TYPE zincha_conversation_sse_authorization_closes_total counter\n",
+                "zincha_conversation_sse_authorization_closes_total {}\n",
+                "# TYPE zincha_conversation_maintenance_rows_removed_total counter\n",
+                "zincha_conversation_maintenance_rows_removed_total {}\n",
+                "# TYPE zincha_conversation_active_sse_connections gauge\n",
+                "zincha_conversation_active_sse_connections {}\n",
+                "# TYPE zincha_conversation_inflight_message_requests gauge\n",
+                "zincha_conversation_inflight_message_requests {}\n",
+                "# TYPE zincha_conversation_inflight_sse_replays gauge\n",
+                "zincha_conversation_inflight_sse_replays {}\n"
+            ),
+            metrics.messages_inserted.load(Ordering::Relaxed),
+            metrics.message_retries.load(Ordering::Relaxed),
+            metrics.message_insert_micros.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+            metrics.authorization_refreshes.load(Ordering::Relaxed),
+            metrics
+                .authorization_refresh_failures
+                .load(Ordering::Relaxed),
+            metrics.sse_resyncs.load(Ordering::Relaxed),
+            metrics.sse_authorization_closes.load(Ordering::Relaxed),
+            metrics.maintenance_rows_removed.load(Ordering::Relaxed),
+            active_sse,
+            inflight_messages,
+            inflight_sse_replays,
+        )
+    }
+
+    pub async fn revoke_delegation(
+        &self,
+        session: &AuthenticatedSession,
+        delegation_id: Uuid,
+    ) -> Result<()> {
+        if session.delegation_id != delegation_id {
+            return Err(Error::Forbidden(
+                "a session may revoke only its own delegation".to_string(),
+            ));
+        }
+        self.db
+            .revoke_delegation(delegation_id, &session.participant_address)
+            .await
+    }
+
+    pub fn spawn_maintenance(&self) {
+        let service = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(
+                service.config.limits.maintenance_interval_ms,
+            ));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let current = now_ms();
+                let batch = i64::from(service.config.limits.maintenance_batch_rows);
+                match service.db.cleanup_ephemeral(current, batch).await {
+                    Ok(removed) => {
+                        service
+                            .metrics
+                            .maintenance_rows_removed
+                            .fetch_add(removed, Ordering::Relaxed);
+                    }
+                    Err(error) => tracing::warn!(%error, "ephemeral cleanup failed"),
+                }
+                service.message_rate_limiter.cleanup(current).await;
+                service
+                    .challenge_address_rate_limiter
+                    .cleanup(current)
+                    .await;
+                service.challenge_global_rate_limiter.cleanup(current).await;
+                service
+                    .streams
+                    .lock()
+                    .await
+                    .retain(|_, sender| sender.receiver_count() > 0);
+                let messages = (service.config.retention.messages_after_terminal_secs as i64)
+                    .saturating_mul(1_000);
+                let audit = (service.config.retention.audit_secs as i64).saturating_mul(1_000);
+                match service
+                    .db
+                    .cleanup_retained(current, messages, audit, batch)
+                    .await
+                {
+                    Ok(removed) => {
+                        service
+                            .metrics
+                            .maintenance_rows_removed
+                            .fetch_add(removed, Ordering::Relaxed);
+                    }
+                    Err(error) => tracing::warn!(%error, "retention cleanup failed"),
+                }
+            }
+        });
+    }
+
+    fn validate_subject(&self, subject: &SubjectRef) -> Result<()> {
+        if subject.network != self.config.chain.network
+            || subject.chain_id != self.config.chain.chain_id
+            || subject.id.len() != 64
+            || !subject
+                .id
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(Error::Invalid(
+                "subject is not valid for this network and chain".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn terminal_write_grace_ms(&self) -> i64 {
+        (self.config.limits.terminal_write_grace_secs as i64).saturating_mul(1_000)
+    }
+
+    async fn refresh_authorization(
+        &self,
+        subject: &SubjectRef,
+        provider: &str,
+    ) -> Result<SubjectSnapshot> {
+        self.metrics
+            .authorization_refreshes
+            .fetch_add(1, Ordering::Relaxed);
+        match self
+            .authorization
+            .resolve(subject, provider, self.terminal_write_grace_ms())
+            .await
+        {
+            Ok(snapshot) => Ok(snapshot),
+            Err(error) => {
+                self.metrics
+                    .authorization_refresh_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                Err(error)
+            }
+        }
+    }
+
+    fn decode_message(
+        &self,
+        conversation: &Conversation,
+        message: StoredMessage,
+    ) -> Result<MessageRecord> {
+        let aad = payload_aad(
+            &message.conversation_id,
+            message.message_id,
+            &message.payload_digest,
+        );
+        let bytes = match conversation.privacy_mode {
+            PrivacyMode::PlatformReadable => self
+                .master_key
+                .decrypt(aad.as_bytes(), &message.payload_blob)?,
+            PrivacyMode::EndToEnd => message.payload_blob,
+        };
+        let payload: MessagePayload = serde_json::from_slice(&bytes)
+            .map_err(|_| Error::Internal("stored message payload cannot be decoded".to_string()))?;
+        if payload_digest(&payload)? != message.payload_digest {
+            return Err(Error::Internal(
+                "stored message payload digest mismatch".to_string(),
+            ));
+        }
+        Ok(MessageRecord {
+            conversation_id: message.conversation_id,
+            sequence: message.sequence,
+            message_id: message.message_id,
+            sender: message.sender,
+            client_timestamp_ms: message.client_timestamp_ms,
+            accepted_at_ms: message.accepted_at_ms,
+            reply_to: message.reply_to,
+            key_epoch: message
+                .key_epoch
+                .map(|value| {
+                    u64::try_from(value).map_err(|_| {
+                        Error::Internal("stored message key epoch is invalid".to_string())
+                    })
+                })
+                .transpose()?,
+            payload,
+            payload_digest: message.payload_digest,
+            signing_key_id: message.signing_key_id,
+            signature: message.signature,
+        })
+    }
+}
+
+pub fn conversation_id(tenant: &str, service_id: &str, subject: &SubjectRef) -> Result<String> {
+    let value = serde_json::json!({
+        "version": 1,
+        "tenant": tenant,
+        "service_id": service_id,
+        "subject": subject,
+    });
+    let canonical = serde_jcs::to_vec(&value)
+        .map_err(|error| Error::Invalid(format!("subject cannot be canonicalized: {error}")))?;
+    Ok(sha256_hex(&canonical))
+}
+
+fn validate_address(address: &str) -> Result<()> {
+    let body = address
+        .strip_prefix("zn1")
+        .ok_or_else(|| Error::Invalid("participant address must use the zn1 prefix".to_string()))?;
+    if body.len() != 40
+        || !body
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(Error::Invalid("participant address is invalid".to_string()));
+    }
+    Ok(())
+}
+
+fn require_participant(
+    snapshot: &crate::model::SubjectSnapshot,
+    address: &str,
+    write: bool,
+    current_time_ms: i64,
+) -> Result<()> {
+    let participant = snapshot
+        .participant(address)
+        .ok_or_else(|| Error::Forbidden("principal is not a workflow participant".to_string()))?;
+    if !participant.can_read || (write && !participant.can_write) {
+        return Err(Error::Forbidden(
+            "workflow participant lacks the requested access".to_string(),
+        ));
+    }
+    if write
+        && snapshot
+            .write_until_ms
+            .is_some_and(|deadline| current_time_ms > deadline)
+    {
+        return Err(Error::Forbidden(
+            "the terminal conversation write window has closed".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_payload(
+    privacy_mode: PrivacyMode,
+    payload: &MessagePayload,
+    key_epoch: Option<u64>,
+) -> Result<()> {
+    match (privacy_mode, payload) {
+        (PrivacyMode::PlatformReadable, MessagePayload::Plaintext { parts }) => {
+            if parts.is_empty() || parts.len() > 256 || key_epoch.is_some() {
+                return Err(Error::Invalid(
+                    "platform-readable messages require parts and no key epoch".to_string(),
+                ));
+            }
+            for part in parts {
+                if let crate::model::MessagePart::ArtifactReference {
+                    digest, media_type, ..
+                } = part
+                {
+                    if digest.len() != 64
+                        || !digest
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                        || media_type.is_empty()
+                        || media_type.len() > 255
+                        || media_type.chars().any(char::is_control)
+                    {
+                        return Err(Error::Invalid(
+                            "artifact references require a lowercase SHA-256 digest and bounded media type"
+                                .to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+        (PrivacyMode::EndToEnd, MessagePayload::Ciphertext { ciphertext }) => {
+            if key_epoch.is_none_or(|epoch| i64::try_from(epoch).is_err())
+                || !is_urlsafe_base64_no_pad(ciphertext)
+            {
+                return Err(Error::Invalid(
+                    "end-to-end messages require URL-safe ciphertext and a bounded key epoch"
+                        .to_string(),
+                ));
+            }
+        }
+        _ => {
+            return Err(Error::Invalid(
+                "payload encoding does not match conversation privacy mode".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn is_urlsafe_base64_no_pad(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() % 4 != 1
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn payload_aad(conversation_id: &str, message_id: Uuid, digest: &str) -> String {
+    format!("zincha-conversation-payload-v1\n{conversation_id}\n{message_id}\n{digest}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn rate_limiter_is_bounded_by_key_and_window() {
+        let limiter = RateLimiter::new(2, 1_000, "limited");
+        assert!(limiter.check("a", 1_000).await.is_ok());
+        assert!(limiter.check("a", 1_100).await.is_ok());
+        assert!(matches!(
+            limiter.check("a", 1_200).await,
+            Err(Error::RateLimited(_))
+        ));
+        assert!(limiter.check("b", 1_200).await.is_ok());
+        assert!(limiter.check("a", 2_000).await.is_ok());
+        limiter.cleanup(4_000).await;
+        assert_eq!(limiter.entry_count().await, 0);
+    }
+
+    #[test]
+    fn terminal_write_deadline_is_enforced_without_removing_read_access() {
+        let participant = "zn100112233445566778899aabbccddeeff00112233";
+        let snapshot = crate::model::SubjectSnapshot {
+            subject: SubjectRef {
+                network: "testnet".to_string(),
+                chain_id: "zincha-test".to_string(),
+                kind: crate::model::SubjectKind::Task,
+                id: "ab".repeat(32),
+            },
+            status: "fulfilled".to_string(),
+            provider: participant.to_string(),
+            participants: vec![crate::model::Participant {
+                address: participant.to_string(),
+                roles: vec![crate::model::ParticipantRole::Provider],
+                can_read: true,
+                can_write: true,
+            }],
+            terminal_at_ms: Some(1_000),
+            write_until_ms: Some(2_000),
+            lifecycle_seq: Some(1),
+            observed_height: 1,
+            observed_block_hash: "cd".repeat(32),
+            observed_at_ms: 1_000,
+            digest: "ef".repeat(32),
+        };
+        assert!(require_participant(&snapshot, participant, true, 2_000).is_ok());
+        assert!(require_participant(&snapshot, participant, true, 2_001).is_err());
+        assert!(require_participant(&snapshot, participant, false, 2_001).is_ok());
+    }
+
+    #[test]
+    fn end_to_end_payload_validation_is_bounded_without_decoding_allocation() {
+        let payload = MessagePayload::Ciphertext {
+            ciphertext: "AA".to_string(),
+        };
+        assert!(validate_payload(PrivacyMode::EndToEnd, &payload, Some(0)).is_ok());
+        assert!(validate_payload(PrivacyMode::EndToEnd, &payload, Some(u64::MAX)).is_err());
+        assert!(validate_payload(
+            PrivacyMode::EndToEnd,
+            &MessagePayload::Ciphertext {
+                ciphertext: "AA==".to_string(),
+            },
+            Some(0),
+        )
+        .is_err());
+    }
+}
