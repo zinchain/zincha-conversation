@@ -423,7 +423,9 @@ impl ConversationService {
                 server
                     .http_builder()
                     .http2()
-                    .max_concurrent_streams(128)
+                    .max_concurrent_streams(
+                        crate::transport::DIRECT_TLS_HTTP2_MAX_CONCURRENT_STREAMS,
+                    )
                     .initial_stream_window_size(1024 * 1024)
                     .initial_connection_window_size(8 * 1024 * 1024);
                 server

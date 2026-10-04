@@ -37,6 +37,7 @@ const CERTIFICATE_CLOCK_SKEW_MS: i64 = 5 * 60 * 1_000;
 const MAX_CERTIFICATE_BYTES: usize = 64 * 1024;
 const MAX_HTTPS_INTERFACE_URL_LENGTH: usize = 2_048;
 const MAX_PROTOCOL_VERSIONS: usize = 64;
+pub const DIRECT_TLS_HTTP2_MAX_CONCURRENT_STREAMS: u32 = 128;
 
 #[derive(Clone)]
 pub struct PreparedDirectTls {

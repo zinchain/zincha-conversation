@@ -13,11 +13,15 @@ use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
 use zincha_conversation::{
     model::ConversationProfileV2,
-    transport::{profile_http_client, validate_profile, ClientTransportPolicy},
+    transport::{
+        profile_http_client, validate_profile, ClientTransportPolicy,
+        DIRECT_TLS_HTTP2_MAX_CONCURRENT_STREAMS,
+    },
 };
 
 const MAX_CONNECTIONS: usize = 100_000;
 const MAX_EVENT_BUFFER_BYTES: usize = 1024 * 1024;
+const IDLE_CONNECTIONS_PER_CLIENT_POOL: usize = 1;
 
 #[derive(Parser)]
 struct Args {
@@ -76,6 +80,7 @@ struct StreamResult {
 struct Report {
     protocol: &'static str,
     transport: &'static str,
+    client_pools: usize,
     requested_connections: usize,
     connected: usize,
     connection_failures: usize,
@@ -103,24 +108,41 @@ async fn main() -> Result<()> {
     .context("decode SSE qualification config")?;
     validate_config(&config)?;
 
-    let selected = profile_http_client(
-        &config.profile,
-        config.transport_policy,
-        Duration::from_secs(config.hold_seconds.saturating_add(60)),
-        0,
-    )
-    .await?;
-    let selected_transport = selected.transport;
-    let base_url = selected.base_url;
-    let client = selected.client;
+    let streams_per_pool = DIRECT_TLS_HTTP2_MAX_CONCURRENT_STREAMS as usize;
+    let client_pool_count = config.connections.div_ceil(streams_per_pool);
+    let request_timeout = Duration::from_secs(sse_request_timeout_secs(&config));
+    let mut clients = Vec::with_capacity(client_pool_count);
+    let mut selected_transport = None;
+    let mut base_url = None;
+    for _ in 0..client_pool_count {
+        let selected = profile_http_client(
+            &config.profile,
+            config.transport_policy,
+            request_timeout,
+            IDLE_CONNECTIONS_PER_CLIENT_POOL,
+        )
+        .await?;
+        if selected_transport.is_some_and(|transport| transport != selected.transport)
+            || base_url
+                .as_ref()
+                .is_some_and(|url: &String| url != &selected.base_url)
+        {
+            bail!("SSE client pools selected inconsistent conversation interfaces");
+        }
+        selected_transport = Some(selected.transport);
+        base_url = Some(selected.base_url);
+        clients.push(selected.client);
+    }
+    let selected_transport = selected_transport.expect("positive connection count creates a pool");
+    let base_url = base_url.expect("positive connection count selects an interface");
     let ramp_started = tokio::time::Instant::now();
     let period = Duration::from_secs_f64(1.0 / f64::from(config.ramp_per_second));
     let mut next = ramp_started;
     let mut open_tasks = JoinSet::new();
-    for _ in 0..config.connections {
+    for index in 0..config.connections {
         tokio::time::sleep_until(next).await;
         next += period;
-        let client = client.clone();
+        let client = clients[index / streams_per_pool].clone();
         let url = format!(
             "{base_url}/v1/conversations/{}/events?after={}&limit=1",
             config.conversation_id, config.after
@@ -212,6 +234,7 @@ async fn main() -> Result<()> {
     let report = Report {
         protocol: "zincha-conversation-v1",
         transport: selected_transport,
+        client_pools: client_pool_count,
         requested_connections: config.connections,
         connected: connect_latencies.len(),
         connection_failures,
@@ -313,6 +336,14 @@ fn validate_config(config: &SseConfig) -> Result<()> {
     Ok(())
 }
 
+fn sse_request_timeout_secs(config: &SseConfig) -> u64 {
+    let ramp_seconds = (config.connections as u64).div_ceil(u64::from(config.ramp_per_second));
+    config
+        .hold_seconds
+        .saturating_add(ramp_seconds)
+        .saturating_add(60)
+}
+
 fn is_hex_id(value: &str) -> bool {
     value.len() == 64
         && value
@@ -354,5 +385,26 @@ mod tests {
         consume_events(&mut buffer, &mut result);
         assert_eq!(result.resync_events, 1);
         assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn request_timeout_covers_ramp_and_hold() {
+        let config = SseConfig {
+            profile: ConversationProfileV2 {
+                version: 2,
+                service_id: "provider/conversations".to_string(),
+                interfaces: vec![],
+                privacy_modes: vec![],
+                protocol_versions: vec![],
+            },
+            transport_policy: ClientTransportPolicy::Auto,
+            conversation_id: "ab".repeat(32),
+            access_token: "token".to_string(),
+            connections: 10_000,
+            ramp_per_second: 1_000,
+            hold_seconds: 600,
+            after: 0,
+        };
+        assert_eq!(sse_request_timeout_secs(&config), 670);
     }
 }

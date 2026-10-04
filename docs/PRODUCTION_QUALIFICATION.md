@@ -168,6 +168,14 @@ Run 9,900 idle streams and 100 active streams concurrently. Run a bounded
 message driver against only the active conversation during the hold interval.
 Raise the load-generator file-descriptor limit before starting.
 
+The SSE driver shards streams across bounded HTTP client pools at the direct
+listener's declared 128-stream HTTP/2 limit. It reuses one pooled TLS
+connection per shard where HTTP/2 is available, rather than paying one TLS
+handshake per SSE stream. The report records `client_pools`; compare that with
+the service handshake counters and reject unexplained excess handshakes. Its
+request deadline covers the complete declared ramp, hold interval, and a
+60-second connection margin.
+
 ```sh
 cargo run --release --example qualification_sse -- \
   --config qualification-sse-idle.json \
