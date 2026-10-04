@@ -250,7 +250,8 @@ async fn postgres_atomic_session_and_concurrent_message_retry() {
         signing_key_id: delegation.delegation_id.to_string(),
         signature: "99".repeat(64),
     };
-    let mut mixed = database
+    let mut writer = database.message_writer().await.unwrap();
+    let mut mixed = writer
         .insert_messages(&[conflicting_retry, final_message])
         .await
         .unwrap()

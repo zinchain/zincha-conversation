@@ -1,11 +1,12 @@
 use std::str::FromStr;
 
 use sqlx::{
+    pool::PoolConnection,
     postgres::{PgPoolOptions, PgRow},
     sqlite::{
         SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow, SqliteSynchronous,
     },
-    PgPool, Row, SqlitePool,
+    Executor, PgPool, Postgres, Row, SqlitePool,
 };
 use uuid::Uuid;
 
@@ -21,6 +22,11 @@ use crate::{
 pub enum Database {
     Sqlite(SqlitePool),
     Postgres(PgPool),
+}
+
+pub struct MessageWriter {
+    database: Database,
+    postgres_connection: Option<PoolConnection<Postgres>>,
 }
 
 #[derive(Debug, Clone)]
@@ -561,6 +567,17 @@ impl Database {
         }
     }
 
+    pub async fn message_writer(&self) -> Result<MessageWriter> {
+        let postgres_connection = match self {
+            Self::Postgres(pool) => Some(pool.acquire().await?),
+            Self::Sqlite(_) => None,
+        };
+        Ok(MessageWriter {
+            database: self.clone(),
+            postgres_connection,
+        })
+    }
+
     pub async fn list_messages(
         &self,
         conversation_id: &str,
@@ -677,6 +694,33 @@ impl Database {
             }
         }
         Ok(removed)
+    }
+}
+
+impl MessageWriter {
+    pub async fn insert_messages(
+        &mut self,
+        messages: &[NewMessage],
+    ) -> Result<Vec<Result<InsertMessageOutcome>>> {
+        if let Database::Postgres(pool) = &self.database {
+            if self.postgres_connection.is_none() {
+                self.postgres_connection = Some(pool.acquire().await?);
+            }
+            let result = insert_messages_postgres_on(
+                &mut **self
+                    .postgres_connection
+                    .as_mut()
+                    .expect("PostgreSQL writer connection was acquired"),
+                messages,
+            )
+            .await;
+            if result.is_err() {
+                self.postgres_connection = None;
+            }
+            result
+        } else {
+            self.database.insert_messages(messages).await
+        }
     }
 }
 
@@ -993,6 +1037,16 @@ async fn insert_messages_postgres(
     pool: &PgPool,
     messages: &[NewMessage],
 ) -> Result<Vec<Result<InsertMessageOutcome>>> {
+    insert_messages_postgres_on(pool, messages).await
+}
+
+async fn insert_messages_postgres_on<'executor, E>(
+    executor: E,
+    messages: &[NewMessage],
+) -> Result<Vec<Result<InsertMessageOutcome>>>
+where
+    E: Executor<'executor, Database = Postgres>,
+{
     let conversation_id = &messages[0].conversation_id;
     if messages
         .iter()
@@ -1058,7 +1112,7 @@ async fn insert_messages_postgres(
     .bind(payload_digests)
     .bind(signing_key_ids)
     .bind(signatures)
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await?;
     if rows.is_empty() {
         return Err(Error::NotFound("conversation not found".to_string()));

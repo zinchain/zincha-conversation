@@ -30,7 +30,9 @@ use crate::{
         ResolveConversationRequest, SessionRequest, SessionResponse, SubjectRef, SubjectSnapshot,
         SubmitMessageRequest,
     },
-    storage::{Database, InsertMessageOutcome, NewMessage, StoredChallenge, StoredMessage},
+    storage::{
+        Database, InsertMessageOutcome, MessageWriter, NewMessage, StoredChallenge, StoredMessage,
+    },
     transport,
 };
 
@@ -89,19 +91,22 @@ struct PendingMessage {
 }
 
 impl MessageIngest {
-    fn new(
+    async fn new(
         db: Database,
         capacity: usize,
         batch_max: usize,
         linger: Duration,
         metrics: Arc<ServiceMetrics>,
-    ) -> Self {
+    ) -> Result<Self> {
         if !db.is_postgres() {
-            return Self::Direct(db);
+            return Ok(Self::Direct(db));
         }
+        let writer = db.message_writer().await?;
         let (sender, receiver) = mpsc::channel(capacity);
-        tokio::spawn(run_message_ingest(db, receiver, batch_max, linger, metrics));
-        Self::Batched(sender)
+        tokio::spawn(run_message_ingest(
+            db, writer, receiver, batch_max, linger, metrics,
+        ));
+        Ok(Self::Batched(sender))
     }
 
     async fn insert(&self, message: NewMessage) -> Result<InsertMessageOutcome> {
@@ -123,6 +128,7 @@ impl MessageIngest {
 
 async fn run_message_ingest(
     db: Database,
+    mut writer: MessageWriter,
     mut receiver: mpsc::Receiver<PendingMessage>,
     batch_max: usize,
     linger: Duration,
@@ -161,6 +167,19 @@ async fn run_message_ingest(
             groups[index].push(message);
         }
 
+        groups.sort_by_key(|group| std::cmp::Reverse(group.len()));
+        let primary = groups.remove(0);
+        let (messages, responses): (Vec<_>, Vec<_>) = primary
+            .into_iter()
+            .map(|pending| (pending.message, pending.response))
+            .unzip();
+        metrics.message_batches.fetch_add(1, Ordering::Relaxed);
+        metrics
+            .message_batch_messages
+            .fetch_add(messages.len() as u64, Ordering::Relaxed);
+        let outcomes = writer.insert_messages(&messages).await;
+        deliver_message_batch(responses, outcomes);
+
         let operations = groups.into_iter().map(|group| {
             let db = db.clone();
             let metrics = metrics.clone();
@@ -177,21 +196,28 @@ async fn run_message_ingest(
             }
         });
         for (responses, outcomes) in futures_util::future::join_all(operations).await {
-            match outcomes {
-                Ok(outcomes) => {
-                    for (response, outcome) in responses.into_iter().zip(outcomes) {
-                        let _ = response.send(outcome);
-                    }
-                }
-                Err(error) => {
-                    tracing::error!(%error, "bounded message batch failed");
-                    let detail = error.to_string();
-                    for response in responses {
-                        let _ = response.send(Err(Error::Internal(format!(
-                            "bounded message batch failed: {detail}"
-                        ))));
-                    }
-                }
+            deliver_message_batch(responses, outcomes);
+        }
+    }
+}
+
+fn deliver_message_batch(
+    responses: Vec<oneshot::Sender<Result<InsertMessageOutcome>>>,
+    outcomes: Result<Vec<Result<InsertMessageOutcome>>>,
+) {
+    match outcomes {
+        Ok(outcomes) => {
+            for (response, outcome) in responses.into_iter().zip(outcomes) {
+                let _ = response.send(outcome);
+            }
+        }
+        Err(error) => {
+            tracing::error!(%error, "bounded message batch failed");
+            let detail = error.to_string();
+            for response in responses {
+                let _ = response.send(Err(Error::Internal(format!(
+                    "bounded message batch failed: {detail}"
+                ))));
             }
         }
     }
@@ -460,7 +486,8 @@ impl ConversationService {
             config.limits.message_batch_max_messages,
             Duration::from_micros(config.limits.message_batch_linger_micros),
             metrics.clone(),
-        );
+        )
+        .await?;
         Ok(Self {
             message_rate_limiter: Arc::new(RateLimiter::new(
                 config.limits.messages_per_second_per_participant,
