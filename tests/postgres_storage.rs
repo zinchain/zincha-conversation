@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -19,6 +19,40 @@ async fn postgres_atomic_session_and_concurrent_message_retry() {
     };
     let database = Database::connect(&database_url, 8).await.unwrap();
     database.migrate().await.unwrap();
+
+    let verification_pool = sqlx::PgPool::connect(&database_url).await.unwrap();
+    let maintenance_options = sqlx::query_as::<_, (String, String, String)>(
+        r#"
+        SELECT relation.relname::TEXT,
+               option.option_name::TEXT,
+               option.option_value::TEXT
+          FROM pg_class AS relation
+          CROSS JOIN LATERAL pg_options_to_table(relation.reloptions) AS option
+         WHERE relation.relname IN ('messages', 'conversation_events')
+         ORDER BY relation.relname, option.option_name
+        "#,
+    )
+    .fetch_all(&verification_pool)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|(relation, option, value)| ((relation, option), value))
+    .collect::<BTreeMap<_, _>>();
+    for relation in ["conversation_events", "messages"] {
+        assert_eq!(
+            maintenance_options
+                .get(&(
+                    relation.to_string(),
+                    "autovacuum_vacuum_insert_threshold".to_string(),
+                ))
+                .map(String::as_str),
+            Some("-1")
+        );
+        assert!(maintenance_options.keys().all(
+            |(configured_relation, option)| configured_relation != relation
+                || option != "autovacuum_enabled"
+        ));
+    }
 
     let unique = Uuid::now_v7();
     let tenant = format!("test-{unique}");
