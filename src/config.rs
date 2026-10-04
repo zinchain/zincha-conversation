@@ -411,6 +411,12 @@ impl Config {
                 "database max_connections must be between 1 and 1000".to_string(),
             ));
         }
+        if self.database.url.starts_with("postgres:") && self.database.max_connections < 2 {
+            return Err(Error::Invalid(
+                "PostgreSQL requires at least two connections so durable message progress is independent of admission reads"
+                    .to_string(),
+            ));
+        }
         if self.chain.network.trim().is_empty()
             || self.chain.network.len() > 64
             || self.chain.chain_id.trim().is_empty()
@@ -696,5 +702,16 @@ backups_secs = 1
         let mut config = example();
         config.limits.terminal_write_grace_secs -= 1;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn postgres_reserves_capacity_for_durable_message_progress() {
+        let mut config = example();
+        config.database.url = "postgres://localhost/zincha_conversation".to_string();
+        config.database.max_connections = 1;
+        assert!(config.validate().is_err());
+
+        config.database.max_connections = 2;
+        config.validate().unwrap();
     }
 }
