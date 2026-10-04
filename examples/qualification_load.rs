@@ -201,15 +201,15 @@ async fn main() -> Result<()> {
     });
 
     let started = tokio::time::Instant::now();
-    let deadline = started + Duration::from_secs(config.duration_seconds);
     let period = Duration::from_secs_f64(1.0 / f64::from(config.rate_per_second));
-    let mut next = started;
+    let mut next = started + period;
+    let offered_target = u64::from(config.rate_per_second).saturating_mul(config.duration_seconds);
     let mut tasks = JoinSet::new();
     let permits = Arc::new(tokio::sync::Semaphore::new(config.max_inflight));
     let mut samples = Samples::default();
     assert_empty_conversation(&http, &base_url, &conversation.id, &session_rx).await?;
 
-    while tokio::time::Instant::now() < deadline {
+    for _ in 0..offered_target {
         tokio::time::sleep_until(next).await;
         next += period;
         samples.offered += 1;

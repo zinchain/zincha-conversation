@@ -96,6 +96,10 @@ conversation. Record the override in the evidence manifest. Keep the secure
 production default unchanged for ordinary deployments, and do not interpret a
 rate-limit rejection as service capacity.
 
+The driver schedules exactly `rate_per_second * duration_seconds` requests,
+with the first request one pacing interval after the recorded start. It does
+not add an unaccounted request at either duration boundary.
+
 The `delegation` value is the complete account-signed
 `ConversationKeyDelegationV1`. The driver refuses a pre-existing conversation,
 keeps response/error/sample memory bounded, rotates short-lived sessions, and

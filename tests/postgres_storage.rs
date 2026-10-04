@@ -118,7 +118,7 @@ async fn postgres_atomic_session_and_concurrent_message_retry() {
     let message = Arc::new(NewMessage {
         conversation_id: conversation_id.clone(),
         message_id: Uuid::now_v7(),
-        sender: participant,
+        sender: participant.clone(),
         client_timestamp_ms: timestamp,
         accepted_at_ms: timestamp,
         reply_to: None,
@@ -152,7 +152,64 @@ async fn postgres_atomic_session_and_concurrent_message_retry() {
         1
     );
 
+    let mut distinct_attempts = Vec::new();
+    for index in 0..64_u64 {
+        let database = database.clone();
+        let message = NewMessage {
+            conversation_id: conversation_id.clone(),
+            message_id: Uuid::now_v7(),
+            sender: participant.clone(),
+            client_timestamp_ms: timestamp,
+            accepted_at_ms: timestamp,
+            reply_to: None,
+            key_epoch: Some(1),
+            payload_blob: index.to_be_bytes().to_vec(),
+            payload_digest: hex::encode(Sha256::digest(index.to_be_bytes())),
+            signing_key_id: delegation.delegation_id.to_string(),
+            signature: "99".repeat(64),
+        };
+        distinct_attempts.push(tokio::spawn(async move {
+            database.insert_message(&message).await.unwrap()
+        }));
+    }
+    let mut sequences = Vec::new();
+    for attempt in distinct_attempts {
+        match attempt.await.unwrap() {
+            InsertMessageOutcome::Inserted(row) => sequences.push(row.sequence),
+            InsertMessageOutcome::Existing(_) => {
+                panic!("a distinct message was treated as a retry")
+            }
+        }
+    }
+    sequences.sort_unstable();
+    assert_eq!(sequences, (2..=65).collect::<Vec<_>>());
+
     if let Database::Postgres(pool) = database {
+        let (message_count, event_count, next_sequence): (i64, i64, i64) = sqlx::query_as(
+            "SELECT
+                 (SELECT COUNT(*) FROM messages WHERE conversation_id = $1),
+                 (SELECT COUNT(*) FROM conversation_events WHERE conversation_id = $1),
+                 (SELECT next_sequence FROM conversations WHERE id = $1)",
+        )
+        .bind(&conversation_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((message_count, event_count, next_sequence), (65, 65, 66));
+        let mismatched_events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)
+               FROM conversation_events AS event
+               JOIN messages AS message
+                 USING (conversation_id, sequence)
+              WHERE event.conversation_id = $1
+                AND (event.event_json->>'message_id' <> message.message_id
+                     OR event.event_json->>'sender' <> message.sender)",
+        )
+        .bind(&conversation_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(mismatched_events, 0);
         sqlx::query("DELETE FROM conversations WHERE id = $1")
             .bind(&conversation_id)
             .execute(&pool)

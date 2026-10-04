@@ -827,37 +827,31 @@ async fn insert_message_postgres(
     pool: &PgPool,
     message: &NewMessage,
 ) -> Result<InsertMessageOutcome> {
-    let mut tx = pool.begin().await?;
-    if let Some(row) = sqlx::query("SELECT sequence, message_id, sender, client_timestamp_ms, accepted_at_ms, reply_to, key_epoch, payload_blob, payload_digest, signing_key_id, signature FROM messages WHERE conversation_id = $1 AND message_id = $2")
-        .bind(&message.conversation_id).bind(message.message_id.to_string()).fetch_optional(&mut *tx).await? {
-        let existing = message_from_postgres(&message.conversation_id, &row)?;
-        validate_idempotent(&existing, message)?;
-        tx.commit().await?;
-        return Ok(InsertMessageOutcome::Existing(existing));
-    }
-    let sequence: i64 = sqlx::query_scalar("UPDATE conversations SET next_sequence = next_sequence + 1, updated_at_ms = $1 WHERE id = $2 RETURNING next_sequence - 1")
-        .bind(message.accepted_at_ms).bind(&message.conversation_id).fetch_optional(&mut *tx).await?
-        .ok_or_else(|| Error::NotFound("conversation not found".to_string()))?;
-    let inserted = sqlx::query("INSERT INTO messages (conversation_id, sequence, message_id, sender, client_timestamp_ms, accepted_at_ms, reply_to, key_epoch, payload_blob, payload_digest, signing_key_id, signature) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT(conversation_id, message_id) DO NOTHING")
-        .bind(&message.conversation_id).bind(sequence).bind(message.message_id.to_string()).bind(&message.sender)
-        .bind(message.client_timestamp_ms).bind(message.accepted_at_ms).bind(message.reply_to.map(|id| id.to_string()))
-        .bind(message.key_epoch).bind(&message.payload_blob).bind(&message.payload_digest)
-        .bind(&message.signing_key_id).bind(&message.signature).execute(&mut *tx).await?.rows_affected();
-    if inserted == 0 {
-        tx.rollback().await?;
-        let row = sqlx::query("SELECT sequence, message_id, sender, client_timestamp_ms, accepted_at_ms, reply_to, key_epoch, payload_blob, payload_digest, signing_key_id, signature FROM messages WHERE conversation_id = $1 AND message_id = $2")
-            .bind(&message.conversation_id).bind(message.message_id.to_string()).fetch_one(pool).await?;
-        let existing = message_from_postgres(&message.conversation_id, &row)?;
-        validate_idempotent(&existing, message)?;
-        return Ok(InsertMessageOutcome::Existing(existing));
-    }
-    let event = serde_json::json!({"sequence": sequence, "message_id": message.message_id, "sender": message.sender});
-    sqlx::query("INSERT INTO conversation_events (conversation_id, sequence, event_type, event_json, created_at_ms) VALUES ($1,$2,'message',$3,$4)")
-        .bind(&message.conversation_id).bind(sequence).bind(event).bind(message.accepted_at_ms).execute(&mut *tx).await?;
-    tx.commit().await?;
-    Ok(InsertMessageOutcome::Inserted(new_to_stored(
-        message, sequence,
-    )))
+    let row =
+        sqlx::query("SELECT * FROM zincha_insert_message_v1($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)")
+            .bind(&message.conversation_id)
+            .bind(message.message_id.to_string())
+            .bind(message.accepted_at_ms)
+            .bind(&message.sender)
+            .bind(message.client_timestamp_ms)
+            .bind(message.reply_to.map(|id| id.to_string()))
+            .bind(message.key_epoch)
+            .bind(&message.payload_blob)
+            .bind(&message.payload_digest)
+            .bind(&message.signing_key_id)
+            .bind(&message.signature)
+            .fetch_optional(pool)
+            .await?
+            .ok_or_else(|| Error::NotFound("conversation not found".to_string()))?;
+
+    let inserted: bool = row.try_get("was_inserted")?;
+    let stored = message_from_postgres(&message.conversation_id, &row)?;
+    validate_idempotent(&stored, message)?;
+    Ok(if inserted {
+        InsertMessageOutcome::Inserted(stored)
+    } else {
+        InsertMessageOutcome::Existing(stored)
+    })
 }
 
 fn validate_idempotent(existing: &StoredMessage, message: &NewMessage) -> Result<()> {
