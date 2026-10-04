@@ -13,15 +13,17 @@ use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
 use zincha_conversation::{
     model::ConversationProfileV2,
-    transport::{
-        profile_http_client, validate_profile, ClientTransportPolicy,
-        DIRECT_TLS_HTTP2_MAX_CONCURRENT_STREAMS,
-    },
+    transport::{profile_http_client, validate_profile, ClientTransportPolicy},
 };
 
 const MAX_CONNECTIONS: usize = 100_000;
 const MAX_EVENT_BUFFER_BYTES: usize = 1024 * 1024;
 const IDLE_CONNECTIONS_PER_CLIENT_POOL: usize = 1;
+// The direct listener advertises 128 streams, while the shared private Axum
+// HTTP/2 listener uses the standard 100-stream limit. Use the lower common
+// bound so a Web-PKI reverse proxy can multiplex without silently queueing the
+// tail of a 10,000-stream population.
+const SSE_CONNECTIONS_PER_CLIENT_POOL: usize = 100;
 
 #[derive(Parser)]
 struct Args {
@@ -108,7 +110,7 @@ async fn main() -> Result<()> {
     .context("decode SSE qualification config")?;
     validate_config(&config)?;
 
-    let streams_per_pool = DIRECT_TLS_HTTP2_MAX_CONCURRENT_STREAMS as usize;
+    let streams_per_pool = SSE_CONNECTIONS_PER_CLIENT_POOL;
     let client_pool_count = config.connections.div_ceil(streams_per_pool);
     let request_timeout = Duration::from_secs(sse_request_timeout_secs(&config));
     let mut clients = Vec::with_capacity(client_pool_count);
