@@ -274,6 +274,8 @@ async fn postgres_atomic_session_and_concurrent_message_retry() {
         .unwrap()
         .unwrap();
     second_conversation.id = second_conversation_id.clone();
+    second_conversation.subject.id = second_conversation_id.clone();
+    second_conversation.snapshot.subject.id = second_conversation_id.clone();
     database
         .upsert_conversation(&second_conversation)
         .await
