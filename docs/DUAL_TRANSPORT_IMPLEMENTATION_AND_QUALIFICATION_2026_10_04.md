@@ -20,23 +20,25 @@ respective repositories.
 
 | Component | Branch | Revision |
 | --- | --- | --- |
-| Conversation service | `codex/conversation-system` | `851fe4d046163a2ffa8666bdf6739c03bd8c1401` |
-| Latest completed mixed qualification runtime | `codex/conversation-system` | `c18f21315e6357102cce1bb780c1319de5b07b55` |
+| Conversation service and final mixed qualification runtime | `codex/conversation-system` | `5d84003e717bceaa5127caa088dd940aa2c2b677` |
 | Qualification SSE harness | `codex/conversation-system` | `be3ce8e130121b74399a8eede511e3d3043b54f0` |
 | Public SDKs | `codex/conversation-system` | `29bc9f20fd82be069bd770a212695ef89da93ac8` |
 | `zincha-dev` embedded SDK/docs | `codex/conversation-system` | `407a54a29582fea527a72cd3d39e9591959ca1f7` |
 
 The optimized Linux package for the current service source is
-`zincha-conversation-851fe4d-linux-x86_64.tar.gz`, SHA-256
-`324fb55e5f661ef3c4c152d9763b47684f6918f4a49feedbcb6939003c8ac418`.
+`zincha-conversation-5d84003-linux-x86_64.tar.gz`, SHA-256
+`ac16b22b65896dbe01c06feea21d3b9b81fb4c984b2d9c2f50d057ebf3016aa5`.
 It was built for `x86_64-unknown-linux-gnu` with Rust 1.94.0, Cargo 1.94.0,
 Zig 0.16.0 and the locked dependency graph. The package contains its build
-manifest and per-file hashes.
+manifest and per-file hashes. The service and load binaries have SHA-256
+`d865653fa043a85777632ade19076a288cbbe0161be936e0fb56849ed7d715b1`
+and `9bfb0c9690ae175fdfee3fc85683b5fa78bed19c6cef8229922839a8753d5337`.
 
 The final SSE qualification harness is built from `be3ce8e`; its Linux
 `qualification_sse` binary has SHA-256
 `145eae39c3de2a92d61930629c6022912786e807f9a7d40fdac06059be80af26`.
-The service and load-generator binaries remain byte-identical to the package.
+The service and load-generator binaries used in the final run match the package
+hashes exactly.
 
 ## Implemented behavior
 
@@ -140,13 +142,33 @@ work was still 9.04% above the 1.107-ms weighted isolated-interface reference,
 outside the unchanged 5% gate. PostgreSQL statistics identified 13 insert-only
 autovacuums and 18 autoanalyzes on each 1.8-million-row append-only hot table.
 
-Revision `851fe4d` therefore changes only the insert-triggered maintenance
-schedule for `messages` and `conversation_events`: a 100,000-row threshold and
-1.0 scale factor produce bounded geometric passes while normal dead-tuple
-vacuum and transaction-ID freeze safeguards remain unchanged. The exact index
-query shapes do not depend on fresh global cardinality estimates. This final
-candidate has passed local tests and PostgreSQL 16 CI; its sustained mixed
-resource qualification remains pending and is not inferred from CI.
+Two retained maintenance experiments did not pass. Revision `851fe4d` moved
+insert vacuum and analyze to a 100,000-row plus 1.0-scale geometric schedule;
+its HTTPS arm lost 711 offers and combined CPU remained about 1.194 ms per
+accepted message. Revision `7b73f6d` used fixed 250,000-row quanta; its HTTPS
+arm lost 1,366 offers and combined CPU was about 1.202 ms per accepted message.
+Both policies still forced repeated full-relation vacuum work despite the two
+hot tables having no dead tuples, so revision `0dda2bf` removed them.
+
+A paired five-minute A/B then isolated admission density. With otherwise
+identical binaries and workloads, increasing the bounded linger from 2 to 8 ms
+reduced conversation groups from 99,009 to 47,500 for 300,000 messages and
+reduced combined service, proxy and PostgreSQL CPU from 1.213 to 1.085 ms per
+message. Both arms reconciled exactly with bounded memory. Revision `4c5189b`
+therefore adopted the 8-ms default while retaining the 16-message cap. Its
+30-minute run met the CPU gate at 1.085 ms per accepted message, but 12
+insert-triggered autovacuums on each append-only table produced late read
+bursts and 1,446 HTTPS client-saturation losses.
+
+Revision `5d84003` disables only insert-triggered vacuum on `messages` and
+`conversation_events`. Ordinary dead-tuple autovacuum remains active for
+retention deletes, automatic analyze remains active for planner statistics,
+and PostgreSQL transaction-ID freeze safeguards are unchanged. The exact
+indexed admission queries do not require visibility-map scans of insert-only
+history. The final 30-minute arm performed zero autovacuums on both hot tables,
+18 autoanalyzes on each, and ordinary autovacuum on the frequently updated
+`conversations` table. It completed the full workload and passed the fixed
+CPU, RSS, latency, completion and maintenance gates.
 
 ## Verification status
 
@@ -173,6 +195,10 @@ results and retained failures are recorded below.
 | Mixed pinned/HTTPS, 5 min discriminator | `9fc1fc6` | 300,000 | 300,000 | 999.972/s aggregate | 0 | 56.035 ms max | 167.979 s service + 22.866 s proxy | 16,687,104 B service + 15,388,672 B proxy | Pass |
 | Mixed pinned/HTTPS, 30 min | `9fc1fc6` | 1,800,000 | 1,800,000 | 999.981/s aggregate | 0 | 3,675.336 ms max | 907.740 s service + 105.119 s proxy | 17,522,688 B service + 15,327,232 B proxy | Completion pass; latency/CPU fail |
 | Mixed pinned/HTTPS, 30 min | `c18f213` | 1,800,000 | 1,800,000 | 999.983/s aggregate | 0 | 356.654 ms max | 952.913 s service + 158.874 s proxy | 12,718,080 B service + 44,380,160 B proxy | Completion pass; CPU remains 9.04% over isolated reference |
+| Mixed pinned/HTTPS, geometric maintenance | `851fe4d` | 1,800,000 | 1,799,289 | 999.589/s aggregate | 711 client saturation | 24.250 ms max | 962.501 s service + 164.564 s proxy | 11,706,368 B service + 41,652,224 B proxy | Completion and CPU fail, preserved |
+| Mixed pinned/HTTPS, fixed maintenance | `7b73f6d` | 1,800,000 | 1,798,634 | 999.190/s aggregate | 1,366 client saturation | 61.764 ms max | 962.135 s service + 164.283 s proxy | 8,146,944 B service + 43,114,496 B proxy | Completion and CPU fail, preserved |
+| Mixed pinned/HTTPS, 8-ms batching | `4c5189b` | 1,800,000 | 1,798,554 | 999.180/s aggregate | 1,446 client saturation | 60.797 ms max | 898.163 s service + 151.425 s proxy | 22,036,480 B service + 41,881,600 B proxy | CPU pass; completion fail, preserved |
+| Mixed pinned/HTTPS, final | `5d84003` | 1,800,000 | 1,800,000 | 999.983/s aggregate | 0 | 34.990 ms max | 902.221 s service + 153.609 s proxy | 21,999,616 B service + 41,660,416 B proxy | **Pass** |
 
 The current Linux qualification host has two vCPUs, 939 MiB RAM, no swap and a
 90-GiB gp3 volume provisioned at 3,000 IOPS and 125 MiB/s. The server and load
@@ -181,8 +207,9 @@ separately. Each isolated arm uses a fresh PostgreSQL 16 database.
 The unprivileged test service listens on `127.0.0.1:8443` for pinned TLS and
 the Web-PKI proxy listens on `conversation.i.qip.sh:9443`, with that hostname
 mapped locally to `127.0.0.1` after public test DNS became unavailable. Nginx
-served the message-throughput arms; HAProxy's HTTP/2 backend served the final
-SSE arms. Production defaults remain port 443 for both public interfaces.
+served the earlier isolated message-throughput arms. HAProxy's HTTP/2 backend
+served the final mixed-message and SSE arms. Production defaults remain port
+443 for both public interfaces.
 
 ### SSE, security and recovery qualification
 
@@ -245,9 +272,38 @@ temporary files, zero deadlocks and no swap. Pinned/HTTPS p95 latency was
 1,061.177 CPU seconds respectively after subtracting the recorded database
 start counter, or 1.207 ms per accepted message. The service, proxy and
 PostgreSQL peaks were approximately 12.1, 42.3 and 507.5 MiB. Normal proxy
-logging produced only seven journal lines. This is the strongest completed
-mixed result, but its 9.04% CPU premium over the weighted isolated reference
-still exceeds the fixed 5% gate.
+logging produced only seven journal lines. This was the strongest completed
+mixed result before the final admission-density and maintenance corrections,
+but its 9.04% CPU premium over the weighted isolated reference exceeded the
+fixed 5% gate.
+
+The final `5d84003` mixed arm reconciled exactly 1,800,000 messages and
+1,800,000 events, split 900,000 per interface, with contiguous sequences, zero
+client saturation, zero request errors, zero retry inserts, zero eligible
+maintenance debt, zero temporary files, zero rollbacks and zero deadlocks.
+Pinned and HTTPS p95 latency was 34.453 and 34.990 ms; p99 was 252.517 and
+352.265 ms. Maximum event-loop lag was 6.716 ms. After subtracting the recorded
+PostgreSQL start counter, service, proxy and PostgreSQL used 902.221, 153.609
+and 877.197 CPU seconds. Their 1,933.027-second total is 1.073904 ms per
+accepted message: 7.62% below the fixed 1.16247-ms gate, 3.00% below the
+1.107116-ms weighted isolated reference and 11.04% below `c18f213`.
+
+Service, proxy and PostgreSQL high-water RSS was 21,999,616, 41,660,416 and
+441,507,840 bytes. Their conservative sum is 505,167,872 bytes, 3.40% below
+the immediately preceding `4c5189b` run and 14.27% below `c18f213`. The service
+ended at 5,800 KiB anonymous PSS and 11,571 KiB file PSS. The larger service
+high-water than the older warm-cache `c18f213` observation is executable-page
+charging on a cold artifact, not retained heap growth: the exact paired
+`4c5189b` artifact had a slightly higher 22,036,480-byte service peak and
+5,900-KiB anonymous PSS. No swap was configured or used.
+
+PostgreSQL recorded zero insert-triggered autovacuums on `messages` and
+`conversation_events`, while running 18 autoanalyzes on each. It continued to
+vacuum the updated `conversations` table normally. Both hot relations ended
+with zero dead tuples, the configured `autovacuum_vacuum_insert_threshold=-1`
+was present on both, and no eligible retention work accumulated. This is the
+expected separation between unnecessary insert-only scans and required
+dead-tuple/freeze maintenance.
 
 The 515,892,654-byte compressed backup had SHA-256
 `3b55945e003ccefb52c2412b490e0a19dc805b3862d9ac5fe2360433cf42f858`.
@@ -295,10 +351,11 @@ ramps briefly exhausted the bounded replay semaphore. A predeclared 499/s and
 any service limit.
 
 The Nginx Web-PKI example passes `nginx -t` with Nginx 1.26.3. It was used for
-the message-throughput arms with one bounded 256-connection upstream
-keepalive pool, TLS 1.3 and HTTP/2, and buffering disabled only for SSE.
+the earlier isolated message-throughput arms with one bounded 256-connection
+upstream keepalive pool, TLS 1.3 and HTTP/2, and buffering disabled only for
+SSE.
 
-That Nginx path passed the message-throughput arms but is not the recommended
+That Nginx path passed those message-throughput arms but is not the recommended
 10,000-SSE topology on a sub-1-GiB host: Nginx proxies each SSE request to the
 private listener over a separate HTTP/1.1 backend socket. It exhausted its
 4,096-worker-connection setting at about 4,061 streams; after the connection
@@ -314,22 +371,20 @@ while the private Axum HTTP/2 listener advertises 100.
 
 The dual-transport implementation, cross-language clients, security matrix,
 rotation, recovery, churn and 10,000-SSE gates are complete. On the declared
-two-CPU tester, each isolated 1,000-message/s transport arm passes and all
-three SSE arms pass with bounded CPU/RSS. The overall production-capacity
-verdict remains **pending/fail** because the strongest completed 30-minute
-mixed arm, although it completed and reconciled every offered message,
-exceeded the isolated weighted CPU reference by 9.04%. No missing completion,
-maintenance, RSS, swap or storage-throughput issue is hidden by that verdict.
+two-CPU tester, each isolated 1,000-message/s transport arm passes, all three
+10,000-client SSE arms pass, and the final 1,000-message/s mixed arm passes the
+fixed completion, correctness, CPU, RSS, latency and maintenance gates. The
+dual-transport implementation is therefore **qualified on the declared test
+topology**. The failed geometric, fixed-quantum and pre-fix runs remain in the
+evidence bundle and are not omitted from the decision.
 
-The largest measured remaining cost is PostgreSQL maintenance and durable-write
-CPU in the mixed path on the colocated two-CPU service/database/load-host
-topology. The latest completed runtime consumed about 1.207 ms per accepted
-message while repeatedly servicing insert-only autovacuum and analyze. The
-`851fe4d` bounded geometric maintenance policy is the next predeclared
-candidate. Promotion requires its sustained run to remain within 5% of the
-weighted isolated CPU reference, preserve bounded RSS and latency, complete
-all work, and show that eligible maintenance does not accumulate; the gate is
-unchanged.
+The largest remaining measured cost is the ordinary PostgreSQL durable-write
+path, but it no longer prevents the target workload or resource gates. The
+final runtime uses 1.073904 ms of service, proxy and database CPU per accepted
+message with bounded queues and residency. The 8-ms linger remains bounded by
+the unchanged 16-message batch cap and trades a small admission delay for fewer
+durable commits; it is part of the qualified runtime and must be held fixed in
+future comparisons.
 
 The test Web-PKI arm uses a current public test wildcard certificate and local
 DNS loopback so it exercises normal platform trust stores and the reverse
@@ -338,3 +393,13 @@ domain. Mock-chain authorization is used to hold chain state stable during
 capacity measurement. Production release qualification remains pending unless
 all rows above pass on the declared production topology with a production
 certificate, production chain projection and the retained evidence bundle.
+That deployment check does not change the passing implementation-capacity
+decision above.
+
+The durable campaign archive stores the final non-secret evidence under
+`evidence/mixed-1800s-5d84003-final` and the Linux artifacts under `artifacts`.
+The repository records their hashes in
+`docs/DUAL_TRANSPORT_FINAL_EVIDENCE_SHA256SUMS_2026_10_04.txt`. The archive
+includes exact load receipts, database reconciliation, table maintenance
+counters, relation options, service memory breakdown, CPU/RSS monitors, I/O
+samples and retained logs.

@@ -1,0 +1,21 @@
+# SHA-256 manifest for the final dual-transport qualification
+# Paths are relative to the durable campaign root.
+93ce3cc318bdc4f1dae70829d465a38a95c54e690a3ad6a6dabbb00f10d3f229  evidence/mixed-1800s-5d84003-final/mixed-final30-5d84003-evidence.txt
+403179ccbde38a55eb027611c1f0c1d958370998fff5b1cd1b611c5c961ff627  evidence/mixed-1800s-5d84003-final/mixed-final30-5d84003-free-after.txt
+bf93c956fb89ec8c5fd4480b160ee16ea818f6955dc07a1709342f07c4b29358  evidence/mixed-1800s-5d84003-final/mixed-final30-5d84003-https-result.json
+0500a673f8f19491f054df6ee4b0f34275fb6b8c94d63d38d6972b5d5c3b6082  evidence/mixed-1800s-5d84003-final/mixed-final30-5d84003-iostat.log
+9cd5eb882a847735c76965ec4b4d6184fa46b3675905ae60f7e6ebd760692290  evidence/mixed-1800s-5d84003-final/mixed-final30-5d84003-load-journal.log
+f3ee6dd870265ca7c63ed5017674bf3920a5fc799ee20734f880ebc2fd5e4e8a  evidence/mixed-1800s-5d84003-final/mixed-final30-5d84003-monitor.log
+378ce73d4211249230bc125340ff6098c4859cb224b35a7f345c2dd613c67531  evidence/mixed-1800s-5d84003-final/mixed-final30-5d84003-pg-relation-sizes-options.txt
+0bbd051c5e1dc7e61e4fbcd033896400e380dd76d3707750ede80f712ca35da3  evidence/mixed-1800s-5d84003-final/mixed-final30-5d84003-pg-stat-bgwriter.txt
+b857e1df940df5aa38ad833ad7ae85bb6ae203249af64467dd6e12a766257a45  evidence/mixed-1800s-5d84003-final/mixed-final30-5d84003-pg-stat-database.txt
+eaab05923adc87beaa4e8e9afbf820c881bcd4d9eccde70e27c951c63b58ad49  evidence/mixed-1800s-5d84003-final/mixed-final30-5d84003-pg-stat-user-tables.txt
+6b2325b3d9f0618734b122ee86aa54bc5486ab094ea812f71e9f71cb55314100  evidence/mixed-1800s-5d84003-final/mixed-final30-5d84003-pinned-result.json
+b063fda8e6930fc8b3c350bc69020950d203232b5a5151c80f19f5f66030e7d7  evidence/mixed-1800s-5d84003-final/mixed-final30-5d84003-postgres-service-start.txt
+3eb799d423ff7c34a6b76ca5da515d11b4bd2dc60064cdba9022a0fa451bd5ed  evidence/mixed-1800s-5d84003-final/mixed-final30-5d84003-proxy-journal.log
+b608a0b420a287448a4f613418a0b8c06cf2123a87aa1e0a173ba54a0f5a923d  evidence/mixed-1800s-5d84003-final/mixed-final30-5d84003-service-journal.log
+10635b7b38398485d700efc82efb8cc78ca1e5ecee9a8b9985141e31a557084d  evidence/mixed-1800s-5d84003-final/mixed-final30-5d84003-service-smaps.txt
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  evidence/mixed-1800s-5d84003-final/mixed-final30-5d84003-swap-after.txt
+b34999b7aa09b6d2808c5bb758fc9a54df1a51fd857227b490ee27dfc159a1f7  evidence/mixed-1800s-5d84003-final/mixed-final30-5d84003-vmstat.log
+ac16b22b65896dbe01c06feea21d3b9b81fb4c984b2d9c2f50d057ebf3016aa5  artifacts/zincha-conversation-5d84003-linux-x86_64.tar.gz
+a59c453fe8fd0511314742fc03ef62cf2ab60f85989df6490fe774122fa94b57  artifacts/postgres_storage-5d84003
