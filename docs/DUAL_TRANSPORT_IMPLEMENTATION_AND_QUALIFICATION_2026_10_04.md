@@ -20,14 +20,15 @@ respective repositories.
 
 | Component | Branch | Revision |
 | --- | --- | --- |
-| Conversation service | `codex/conversation-system` | `9fc1fc63d83e9ea86bd0254e7c1102d8881ac5a7` |
+| Conversation service | `codex/conversation-system` | `851fe4d046163a2ffa8666bdf6739c03bd8c1401` |
+| Latest completed mixed qualification runtime | `codex/conversation-system` | `c18f21315e6357102cce1bb780c1319de5b07b55` |
 | Qualification SSE harness | `codex/conversation-system` | `be3ce8e130121b74399a8eede511e3d3043b54f0` |
 | Public SDKs | `codex/conversation-system` | `29bc9f20fd82be069bd770a212695ef89da93ac8` |
 | `zincha-dev` embedded SDK/docs | `codex/conversation-system` | `407a54a29582fea527a72cd3d39e9591959ca1f7` |
 
-The optimized Linux package for the final service source is
-`zincha-conversation-9fc1fc6-linux-x86_64.tar.gz`, SHA-256
-`b8206affe7052abf51a4f510799041fafe1d04b41cf2efa06672b4ab9c647cf7`.
+The optimized Linux package for the current service source is
+`zincha-conversation-851fe4d-linux-x86_64.tar.gz`, SHA-256
+`324fb55e5f661ef3c4c152d9763b47684f6918f4a49feedbcb6939003c8ac418`.
 It was built for `x86_64-unknown-linux-gnu` with Rust 1.94.0, Cargo 1.94.0,
 Zig 0.16.0 and the locked dependency graph. The package contains its build
 manifest and per-file hashes.
@@ -122,6 +123,31 @@ identities; it does not change the runtime binary. The real database test
 proves two valid groups commit with independent contiguous sequences while a
 missing-conversation group fails in isolation.
 
+Revisions `f37f4ad`, `195c323` and `29a0f19` replace those sequential
+conversation-local savepoints with one canonically locked, set-based statement
+across every conversation in a bounded admission slice. Exact retry lookup is
+driven from the bounded input rather than the growing messages table, and
+Rust-side deduplication plus compact inserted-row results avoid returning or
+copying payload bytes that the worker already owns. Revision `c18f213` also
+stops normal successful HAProxy requests from generating one journal record
+per message while preserving warnings and errors.
+
+The resulting `c18f213` 30-minute mixed arm completed and reconciled every
+message. It reduced service, proxy and database CPU work from 1.435 to 1.207
+ms per accepted message, a 15.9% improvement over `9fc1fc6`, and reduced the
+maximum transport p95 from about 3.68 seconds to 356.654 ms. The remaining CPU
+work was still 9.04% above the 1.107-ms weighted isolated-interface reference,
+outside the unchanged 5% gate. PostgreSQL statistics identified 13 insert-only
+autovacuums and 18 autoanalyzes on each 1.8-million-row append-only hot table.
+
+Revision `851fe4d` therefore changes only the insert-triggered maintenance
+schedule for `messages` and `conversation_events`: a 100,000-row threshold and
+1.0 scale factor produce bounded geometric passes while normal dead-tuple
+vacuum and transaction-ID freeze safeguards remain unchanged. The exact index
+query shapes do not depend on fresh global cardinality estimates. This final
+candidate has passed local tests and PostgreSQL 16 CI; its sustained mixed
+resource qualification remains pending and is not inferred from CI.
+
 ## Verification status
 
 Formatting, strict all-target Clippy and all unit/service/OpenAPI/SQLite tests
@@ -146,6 +172,7 @@ results and retained failures are recorded below.
 | Mixed pinned/HTTPS, 30 min | `23ec945` | 1,800,000 | 1,796,753 | 998.178/s | 3,247 client saturation | ~3,146 ms | 955.604 s service + 127.421 s proxy | 18,452,480 B service + 15,564,800 B proxy | Fail, preserved |
 | Mixed pinned/HTTPS, 5 min discriminator | `9fc1fc6` | 300,000 | 300,000 | 999.972/s aggregate | 0 | 56.035 ms max | 167.979 s service + 22.866 s proxy | 16,687,104 B service + 15,388,672 B proxy | Pass |
 | Mixed pinned/HTTPS, 30 min | `9fc1fc6` | 1,800,000 | 1,800,000 | 999.981/s aggregate | 0 | 3,675.336 ms max | 907.740 s service + 105.119 s proxy | 17,522,688 B service + 15,327,232 B proxy | Completion pass; latency/CPU fail |
+| Mixed pinned/HTTPS, 30 min | `c18f213` | 1,800,000 | 1,800,000 | 999.983/s aggregate | 0 | 356.654 ms max | 952.913 s service + 158.874 s proxy | 12,718,080 B service + 44,380,160 B proxy | Completion pass; CPU remains 9.04% over isolated reference |
 
 The current Linux qualification host has two vCPUs, 939 MiB RAM, no swap and a
 90-GiB gp3 volume provisioned at 3,000 IOPS and 125 MiB/s. The server and load
@@ -209,6 +236,18 @@ storage utilization was modest and PostgreSQL reported no temporary-file or
 lock-wait failure, so the remaining full-duration latency is a CPU/scheduling
 capacity problem on this colocated two-CPU topology rather than a completion,
 memory or gp3-throughput failure.
+
+The subsequent `c18f213` mixed arm again reconciled 1,800,000 messages and
+events, exactly 900,000 per conversation, with contiguous sequences, zero
+client saturation, zero request errors, zero eligible maintenance debt, zero
+temporary files, zero deadlocks and no swap. Pinned/HTTPS p95 latency was
+194.535/356.654 ms. Service, proxy and PostgreSQL used 952.913, 158.874 and
+1,061.177 CPU seconds respectively after subtracting the recorded database
+start counter, or 1.207 ms per accepted message. The service, proxy and
+PostgreSQL peaks were approximately 12.1, 42.3 and 507.5 MiB. Normal proxy
+logging produced only seven journal lines. This is the strongest completed
+mixed result, but its 9.04% CPU premium over the weighted isolated reference
+still exceeds the fixed 5% gate.
 
 The 515,892,654-byte compressed backup had SHA-256
 `3b55945e003ccefb52c2412b490e0a19dc805b3862d9ac5fe2360433cf42f858`.
@@ -277,19 +316,20 @@ The dual-transport implementation, cross-language clients, security matrix,
 rotation, recovery, churn and 10,000-SSE gates are complete. On the declared
 two-CPU tester, each isolated 1,000-message/s transport arm passes and all
 three SSE arms pass with bounded CPU/RSS. The overall production-capacity
-verdict remains **pending/fail** because the 30-minute mixed two-conversation
-arm, although it completed and reconciled every offered message, exceeded the
-isolated weighted CPU reference by 29.6% and reached about 3.68 seconds p95.
-No missing completion, maintenance, RSS, swap or storage-throughput issue is
-being hidden by that verdict.
+verdict remains **pending/fail** because the strongest completed 30-minute
+mixed arm, although it completed and reconciled every offered message,
+exceeded the isolated weighted CPU reference by 9.04%. No missing completion,
+maintenance, RSS, swap or storage-throughput issue is hidden by that verdict.
 
-The largest measured remaining bottleneck is CPU/scheduler capacity in the
-mixed durable-write path on the colocated two-CPU service/database/load-host
-topology. PostgreSQL and the service/proxy consumed about 1.435 ms per accepted
-message and the generator consumed another 540 CPU seconds during the same
-1,800-second interval. Promotion therefore requires either a measured code
-reduction in mixed durable-write CPU or a newly declared production topology;
-the gate must not be changed after observing this result.
+The largest measured remaining cost is PostgreSQL maintenance and durable-write
+CPU in the mixed path on the colocated two-CPU service/database/load-host
+topology. The latest completed runtime consumed about 1.207 ms per accepted
+message while repeatedly servicing insert-only autovacuum and analyze. The
+`851fe4d` bounded geometric maintenance policy is the next predeclared
+candidate. Promotion requires its sustained run to remain within 5% of the
+weighted isolated CPU reference, preserve bounded RSS and latency, complete
+all work, and show that eligible maintenance does not accumulate; the gate is
+unchanged.
 
 The test Web-PKI arm uses a current public test wildcard certificate and local
 DNS loopback so it exercises normal platform trust stores and the reverse
