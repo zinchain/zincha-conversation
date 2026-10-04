@@ -267,7 +267,7 @@ impl Config {
         for interface in &self.service.interfaces {
             let identity = match interface {
                 ServiceInterfaceConfig::Https { url } => {
-                    if url.len() > MAX_HTTPS_INTERFACE_URL_LENGTH {
+                    if url.chars().count() > MAX_HTTPS_INTERFACE_URL_LENGTH {
                         return Err(Error::Invalid(
                             "HTTPS interface URL exceeds the supported length".to_string(),
                         ));
