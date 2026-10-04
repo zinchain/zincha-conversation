@@ -174,6 +174,10 @@ where
             metrics.tls_handshakes.fetch_add(1, Ordering::Relaxed);
             match inner.accept(stream, service).await {
                 Ok((stream, service)) => {
+                    metrics.tls_handshake_micros.fetch_add(
+                        started.elapsed().as_micros().min(u64::MAX as u128) as u64,
+                        Ordering::Relaxed,
+                    );
                     let connection_permit =
                         connection_permits.try_acquire_owned().map_err(|_| {
                             metrics
@@ -184,10 +188,6 @@ where
                                 "TLS connection capacity exhausted",
                             )
                         })?;
-                    metrics.tls_handshake_micros.fetch_add(
-                        started.elapsed().as_micros().min(u64::MAX as u128) as u64,
-                        Ordering::Relaxed,
-                    );
                     metrics
                         .tls_active_connections
                         .fetch_add(1, Ordering::Relaxed);
