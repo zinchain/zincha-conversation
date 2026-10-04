@@ -6,7 +6,7 @@ use sqlx::{
     sqlite::{
         SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow, SqliteSynchronous,
     },
-    Executor, PgPool, Postgres, Row, SqlitePool,
+    Acquire, Executor, PgPool, Postgres, Row, SqlitePool,
 };
 use uuid::Uuid;
 
@@ -722,6 +722,64 @@ impl MessageWriter {
             self.database.insert_messages(messages).await
         }
     }
+
+    /// Commits one bounded set of conversation-local batches with one durable
+    /// PostgreSQL commit. Each conversation runs inside a savepoint so a
+    /// missing or otherwise invalid conversation does not discard successful
+    /// independent groups in the same admission slice.
+    pub async fn insert_message_groups(
+        &mut self,
+        groups: &[Vec<NewMessage>],
+    ) -> Result<Vec<Result<Vec<Result<InsertMessageOutcome>>>>> {
+        if groups.is_empty() {
+            return Ok(Vec::new());
+        }
+        if let Database::Postgres(pool) = &self.database {
+            if self.postgres_connection.is_none() {
+                self.postgres_connection = Some(pool.acquire().await?);
+            }
+            let result = insert_message_groups_postgres_on(
+                self.postgres_connection
+                    .as_mut()
+                    .expect("PostgreSQL writer connection was acquired"),
+                groups,
+            )
+            .await;
+            if result.is_err() {
+                self.postgres_connection = None;
+            }
+            result
+        } else {
+            let mut outcomes = Vec::with_capacity(groups.len());
+            for messages in groups {
+                outcomes.push(self.database.insert_messages(messages).await);
+            }
+            Ok(outcomes)
+        }
+    }
+}
+
+async fn insert_message_groups_postgres_on(
+    connection: &mut sqlx::PgConnection,
+    groups: &[Vec<NewMessage>],
+) -> Result<Vec<Result<Vec<Result<InsertMessageOutcome>>>>> {
+    let mut transaction = connection.begin().await?;
+    let mut outcomes = Vec::with_capacity(groups.len());
+    for messages in groups {
+        let mut savepoint = transaction.begin().await?;
+        match insert_messages_postgres_on(&mut *savepoint, messages).await {
+            Ok(group_outcomes) => {
+                savepoint.commit().await?;
+                outcomes.push(Ok(group_outcomes));
+            }
+            Err(error) => {
+                savepoint.rollback().await?;
+                outcomes.push(Err(error));
+            }
+        }
+    }
+    transaction.commit().await?;
+    Ok(outcomes)
 }
 
 fn validate_existing_delegation(

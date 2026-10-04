@@ -104,7 +104,7 @@ impl MessageIngest {
         let writer = db.message_writer().await?;
         let (sender, receiver) = mpsc::channel(capacity);
         tokio::spawn(run_message_ingest(
-            db, writer, receiver, batch_max, linger, metrics,
+            writer, receiver, batch_max, linger, metrics,
         ));
         Ok(Self::Batched(sender))
     }
@@ -127,7 +127,6 @@ impl MessageIngest {
 }
 
 async fn run_message_ingest(
-    db: Database,
     mut writer: MessageWriter,
     mut receiver: mpsc::Receiver<PendingMessage>,
     batch_max: usize,
@@ -167,36 +166,56 @@ async fn run_message_ingest(
             groups[index].push(message);
         }
 
-        groups.sort_by_key(|group| std::cmp::Reverse(group.len()));
-        let primary = groups.remove(0);
-        let (messages, responses): (Vec<_>, Vec<_>) = primary
-            .into_iter()
-            .map(|pending| (pending.message, pending.response))
-            .unzip();
-        metrics.message_batches.fetch_add(1, Ordering::Relaxed);
-        metrics
-            .message_batch_messages
-            .fetch_add(messages.len() as u64, Ordering::Relaxed);
-        let outcomes = writer.insert_messages(&messages).await;
-        deliver_message_batch(responses, outcomes);
-
-        let operations = groups.into_iter().map(|group| {
-            let db = db.clone();
-            let metrics = metrics.clone();
-            async move {
-                let (messages, responses): (Vec<_>, Vec<_>) = group
-                    .into_iter()
-                    .map(|pending| (pending.message, pending.response))
-                    .unzip();
-                metrics.message_batches.fetch_add(1, Ordering::Relaxed);
-                metrics
-                    .message_batch_messages
-                    .fetch_add(messages.len() as u64, Ordering::Relaxed);
-                (responses, db.insert_messages(&messages).await)
-            }
+        // A deterministic order prevents a future multi-writer deployment from
+        // acquiring conversation sequence locks in conflicting orders.
+        groups.sort_by(|left, right| {
+            left[0]
+                .message
+                .conversation_id
+                .cmp(&right[0].message.conversation_id)
         });
-        for (responses, outcomes) in futures_util::future::join_all(operations).await {
-            deliver_message_batch(responses, outcomes);
+        let mut message_groups = Vec::with_capacity(groups.len());
+        let mut response_groups = Vec::with_capacity(groups.len());
+        for group in groups {
+            let (messages, responses): (Vec<_>, Vec<_>) = group
+                .into_iter()
+                .map(|pending| (pending.message, pending.response))
+                .unzip();
+            metrics.message_batches.fetch_add(1, Ordering::Relaxed);
+            metrics
+                .message_batch_messages
+                .fetch_add(messages.len() as u64, Ordering::Relaxed);
+            message_groups.push(messages);
+            response_groups.push(responses);
+        }
+
+        match writer.insert_message_groups(&message_groups).await {
+            Ok(group_outcomes) if group_outcomes.len() == response_groups.len() => {
+                for (responses, outcomes) in response_groups.into_iter().zip(group_outcomes) {
+                    deliver_message_batch(responses, outcomes);
+                }
+            }
+            Ok(_) => {
+                for responses in response_groups {
+                    deliver_message_batch(
+                        responses,
+                        Err(Error::Internal(
+                            "PostgreSQL returned incomplete conversation groups".to_string(),
+                        )),
+                    );
+                }
+            }
+            Err(error) => {
+                let detail = error.to_string();
+                for responses in response_groups {
+                    deliver_message_batch(
+                        responses,
+                        Err(Error::Internal(format!(
+                            "bounded conversation batch failed: {detail}"
+                        ))),
+                    );
+                }
+            }
         }
     }
 }

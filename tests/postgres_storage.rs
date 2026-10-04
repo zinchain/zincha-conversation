@@ -267,6 +267,55 @@ async fn postgres_atomic_session_and_concurrent_message_retry() {
         InsertMessageOutcome::Existing(_) => panic!("the final distinct message was a retry"),
     }
 
+    let second_conversation_id = hex::encode(Sha256::digest(b"second conversation"));
+    let mut second_conversation = database
+        .get_conversation(&conversation_id)
+        .await
+        .unwrap()
+        .unwrap();
+    second_conversation.id = second_conversation_id.clone();
+    database
+        .upsert_conversation(&second_conversation)
+        .await
+        .unwrap();
+    let grouped_message = |target: &str, payload: &[u8]| NewMessage {
+        conversation_id: target.to_string(),
+        message_id: Uuid::now_v7(),
+        sender: message.sender.clone(),
+        client_timestamp_ms: timestamp,
+        accepted_at_ms: timestamp,
+        reply_to: None,
+        key_epoch: Some(1),
+        payload_blob: payload.to_vec(),
+        payload_digest: hex::encode(Sha256::digest(payload)),
+        signing_key_id: delegation.delegation_id.to_string(),
+        signature: "99".repeat(64),
+    };
+    let grouped_messages = vec![
+        vec![grouped_message(&conversation_id, b"first group")],
+        vec![grouped_message(&"f".repeat(64), b"missing group")],
+        vec![grouped_message(&second_conversation_id, b"second group")],
+    ];
+    let mut grouped = writer
+        .insert_message_groups(&grouped_messages)
+        .await
+        .unwrap()
+        .into_iter();
+    match grouped.next().unwrap().unwrap()[0].as_ref().unwrap() {
+        InsertMessageOutcome::Inserted(row) => assert_eq!(row.sequence, 99),
+        InsertMessageOutcome::Existing(_) => panic!("the first group was treated as a retry"),
+    }
+    assert!(grouped
+        .next()
+        .unwrap()
+        .unwrap_err()
+        .to_string()
+        .starts_with("resource not found:"));
+    match grouped.next().unwrap().unwrap()[0].as_ref().unwrap() {
+        InsertMessageOutcome::Inserted(row) => assert_eq!(row.sequence, 1),
+        InsertMessageOutcome::Existing(_) => panic!("the second group was treated as a retry"),
+    }
+
     if let Database::Postgres(pool) = database {
         let (message_count, event_count, next_sequence): (i64, i64, i64) = sqlx::query_as(
             "SELECT
@@ -278,7 +327,7 @@ async fn postgres_atomic_session_and_concurrent_message_retry() {
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!((message_count, event_count, next_sequence), (98, 98, 99));
+        assert_eq!((message_count, event_count, next_sequence), (99, 99, 100));
         let mismatched_events: i64 = sqlx::query_scalar(
             "SELECT COUNT(*)
                FROM conversation_events AS event
@@ -293,6 +342,22 @@ async fn postgres_atomic_session_and_concurrent_message_retry() {
         .await
         .unwrap();
         assert_eq!(mismatched_events, 0);
+        let second_counts: (i64, i64, i64) = sqlx::query_as(
+            "SELECT
+                 (SELECT COUNT(*) FROM messages WHERE conversation_id = $1),
+                 (SELECT COUNT(*) FROM conversation_events WHERE conversation_id = $1),
+                 (SELECT next_sequence FROM conversations WHERE id = $1)",
+        )
+        .bind(&second_conversation_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(second_counts, (1, 1, 2));
+        sqlx::query("DELETE FROM conversations WHERE id = $1")
+            .bind(&second_conversation_id)
+            .execute(&pool)
+            .await
+            .unwrap();
         sqlx::query("DELETE FROM conversations WHERE id = $1")
             .bind(&conversation_id)
             .execute(&pool)
