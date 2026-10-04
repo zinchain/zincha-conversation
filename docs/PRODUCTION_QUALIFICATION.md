@@ -115,6 +115,13 @@ The driver schedules exactly `rate_per_second * duration_seconds` requests,
 with the first request one pacing interval after the recorded start. It does
 not add an unaccounted request at either duration boundary.
 
+Record `pg_stat_user_tables` before and after sustained PostgreSQL arms. The
+message and event tables retain normal dead-tuple vacuum behavior for terminal
+retention, while insert-only vacuum and analyze use the schema's bounded
+100,000-row plus 1.0-scale schedule. A run is incomplete if those maintenance
+passes accumulate without service or if transaction-ID freeze debt approaches
+PostgreSQL's configured safety limit.
+
 The `delegation` value is the complete account-signed
 `ConversationKeyDelegationV1`. The driver refuses a pre-existing conversation,
 keeps response/error/sample memory bounded, rotates short-lived sessions, and
