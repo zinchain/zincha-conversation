@@ -16,6 +16,8 @@ For every run capture:
 
 - accepted and offered messages, durable sequence span, error classes, and
   p50/p95/p99 client latency;
+- bounded PostgreSQL message-batch count, admitted messages per batch, and the
+  configured maximum size and linger interval;
 - service CPU%, CPU seconds per accepted message, current RSS, RSS high-water,
   event-loop lag, in-flight inserts, active SSE streams, and resync counts;
 - PostgreSQL transaction rate, commit latency, connection occupancy, WAL rate,
@@ -95,6 +97,11 @@ rate because this driver intentionally measures one hot participant and one
 conversation. Record the override in the evidence manifest. Keep the secure
 production default unchanged for ordinary deployments, and do not interpret a
 rate-limit rejection as service capacity.
+
+Keep `message_batch_max_messages` and `message_batch_linger_micros` fixed
+across transport comparisons. They bound retained request memory and added
+queue latency. Report both values with the batch/message counters; changing
+them makes a new capacity candidate rather than a repeat observation.
 
 The driver schedules exactly `rate_per_second * duration_seconds` requests,
 with the first request one pacing interval after the recorded start. It does

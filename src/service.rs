@@ -9,10 +9,11 @@ use std::{
         Arc,
     },
     task::{Context, Poll},
+    time::Duration,
 };
 
 use axum_server::{accept::Accept, tls_rustls::RustlsAcceptor};
-use tokio::sync::{broadcast, Mutex, Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex, Notify, OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 
 use crate::{
@@ -48,6 +49,7 @@ pub struct ConversationService {
     challenge_address_rate_limiter: Arc<RateLimiter>,
     challenge_global_rate_limiter: Arc<RateLimiter>,
     message_permits: Arc<Semaphore>,
+    message_ingest: MessageIngest,
     sse_permits: Arc<Semaphore>,
     sse_replay_permits: Arc<Semaphore>,
     metrics: Arc<ServiceMetrics>,
@@ -58,6 +60,8 @@ struct ServiceMetrics {
     messages_inserted: AtomicU64,
     message_retries: AtomicU64,
     message_insert_micros: AtomicU64,
+    message_batches: AtomicU64,
+    message_batch_messages: AtomicU64,
     authorization_refreshes: AtomicU64,
     authorization_refresh_failures: AtomicU64,
     sse_resyncs: AtomicU64,
@@ -71,6 +75,126 @@ struct ServiceMetrics {
     tls_handshake_timeouts: AtomicU64,
     tls_handshake_micros: AtomicU64,
     tls_connection_rejections: AtomicU64,
+}
+
+#[derive(Clone)]
+enum MessageIngest {
+    Direct(Database),
+    Batched(mpsc::Sender<PendingMessage>),
+}
+
+struct PendingMessage {
+    message: NewMessage,
+    response: oneshot::Sender<Result<InsertMessageOutcome>>,
+}
+
+impl MessageIngest {
+    fn new(
+        db: Database,
+        capacity: usize,
+        batch_max: usize,
+        linger: Duration,
+        metrics: Arc<ServiceMetrics>,
+    ) -> Self {
+        if !db.is_postgres() {
+            return Self::Direct(db);
+        }
+        let (sender, receiver) = mpsc::channel(capacity);
+        tokio::spawn(run_message_ingest(db, receiver, batch_max, linger, metrics));
+        Self::Batched(sender)
+    }
+
+    async fn insert(&self, message: NewMessage) -> Result<InsertMessageOutcome> {
+        match self {
+            Self::Direct(db) => db.insert_message(&message).await,
+            Self::Batched(sender) => {
+                let (response, result) = oneshot::channel();
+                sender
+                    .send(PendingMessage { message, response })
+                    .await
+                    .map_err(|_| Error::Unavailable("message ingest worker stopped".to_string()))?;
+                result
+                    .await
+                    .map_err(|_| Error::Unavailable("message ingest worker stopped".to_string()))?
+            }
+        }
+    }
+}
+
+async fn run_message_ingest(
+    db: Database,
+    mut receiver: mpsc::Receiver<PendingMessage>,
+    batch_max: usize,
+    linger: Duration,
+    metrics: Arc<ServiceMetrics>,
+) {
+    while let Some(first) = receiver.recv().await {
+        let mut pending = Vec::with_capacity(batch_max);
+        pending.push(first);
+        let deadline = tokio::time::Instant::now() + linger;
+        while pending.len() < batch_max {
+            match receiver.try_recv() {
+                Ok(message) => pending.push(message),
+                Err(mpsc::error::TryRecvError::Disconnected) => break,
+                Err(mpsc::error::TryRecvError::Empty) => {
+                    match tokio::time::timeout_at(deadline, receiver.recv()).await {
+                        Ok(Some(message)) => pending.push(message),
+                        Ok(None) | Err(_) => break,
+                    }
+                }
+            }
+        }
+
+        let mut group_indexes = HashMap::<String, usize>::new();
+        let mut groups = Vec::<Vec<PendingMessage>>::new();
+        for message in pending {
+            let conversation_id = message.message.conversation_id.clone();
+            let index = match group_indexes.get(&conversation_id) {
+                Some(index) => *index,
+                None => {
+                    let index = groups.len();
+                    groups.push(Vec::new());
+                    group_indexes.insert(conversation_id, index);
+                    index
+                }
+            };
+            groups[index].push(message);
+        }
+
+        let operations = groups.into_iter().map(|group| {
+            let db = db.clone();
+            let metrics = metrics.clone();
+            async move {
+                let (messages, responses): (Vec<_>, Vec<_>) = group
+                    .into_iter()
+                    .map(|pending| (pending.message, pending.response))
+                    .unzip();
+                metrics.message_batches.fetch_add(1, Ordering::Relaxed);
+                metrics
+                    .message_batch_messages
+                    .fetch_add(messages.len() as u64, Ordering::Relaxed);
+                (responses, db.insert_messages(&messages).await)
+            }
+        });
+        for (responses, outcomes) in futures_util::future::join_all(operations).await {
+            match outcomes {
+                Ok(outcomes) => {
+                    for (response, outcome) in responses.into_iter().zip(outcomes) {
+                        let _ = response.send(Ok(outcome));
+                    }
+                }
+                Err(error) => {
+                    tracing::error!(%error, "bounded message batch failed");
+                    let detail = error.to_string();
+                    for response in responses {
+                        let _ = response.send(Err(Error::Internal(format!(
+                            "bounded message batch failed: {detail}"
+                        ))));
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -329,6 +453,14 @@ impl ConversationService {
         config.validate()?;
         let prepared_transport = transport::prepare_service_transport(&config)?;
         let profile = Arc::new(prepared_transport.profile);
+        let metrics = Arc::new(ServiceMetrics::default());
+        let message_ingest = MessageIngest::new(
+            db.clone(),
+            config.limits.max_inflight_messages,
+            config.limits.message_batch_max_messages,
+            Duration::from_micros(config.limits.message_batch_linger_micros),
+            metrics.clone(),
+        );
         Ok(Self {
             message_rate_limiter: Arc::new(RateLimiter::new(
                 config.limits.messages_per_second_per_participant,
@@ -346,9 +478,10 @@ impl ConversationService {
                 "global challenge rate exceeded",
             )),
             message_permits: Arc::new(Semaphore::new(config.limits.max_inflight_messages)),
+            message_ingest,
             sse_permits: Arc::new(Semaphore::new(config.limits.max_sse_connections)),
             sse_replay_permits: Arc::new(Semaphore::new(config.limits.max_inflight_sse_replays)),
-            metrics: Arc::new(ServiceMetrics::default()),
+            metrics,
             profile,
             direct_tls: prepared_transport.direct_tls,
             ready: Arc::new(AtomicBool::new(false)),
@@ -667,16 +800,48 @@ impl ConversationService {
         conversation_id: &str,
         require_write: bool,
     ) -> Result<Conversation> {
+        let conversation = self
+            .db
+            .get_conversation(conversation_id)
+            .await?
+            .ok_or_else(|| Error::NotFound("conversation not found".to_string()))?;
+        self.authorize_loaded_conversation(session, conversation_id, conversation, require_write)
+            .await
+    }
+
+    async fn authenticate_conversation(
+        &self,
+        bearer_token: &str,
+        conversation_id: &str,
+        require_write: bool,
+    ) -> Result<(AuthenticatedSession, Conversation)> {
+        if bearer_token.is_empty() || bearer_token.len() > 256 {
+            return Err(Error::Authentication("invalid access token".to_string()));
+        }
+        let (session, conversation) = self
+            .db
+            .authenticate_session_conversation(&token_hash(bearer_token), now_ms())
+            .await?;
+        let conversation =
+            conversation.ok_or_else(|| Error::NotFound("conversation not found".to_string()))?;
+        let conversation = self
+            .authorize_loaded_conversation(&session, conversation_id, conversation, require_write)
+            .await?;
+        Ok((session, conversation))
+    }
+
+    async fn authorize_loaded_conversation(
+        &self,
+        session: &AuthenticatedSession,
+        conversation_id: &str,
+        mut conversation: Conversation,
+        require_write: bool,
+    ) -> Result<Conversation> {
         if session.conversation_id != conversation_id {
             return Err(Error::Forbidden(
                 "session is scoped to another conversation".to_string(),
             ));
         }
-        let mut conversation = self
-            .db
-            .get_conversation(conversation_id)
-            .await?
-            .ok_or_else(|| Error::NotFound("conversation not found".to_string()))?;
         if conversation.tenant_id != session.tenant_id {
             return Err(Error::Forbidden("tenant mismatch".to_string()));
         }
@@ -800,6 +965,40 @@ impl ConversationService {
             .check(&session.participant_address, current)
             .await?;
         let conversation = self.conversation(session, conversation_id, true).await?;
+        self.submit_authorized_message(session, conversation_id, conversation, request, current)
+            .await
+    }
+
+    pub async fn submit_authenticated_message(
+        &self,
+        bearer_token: &str,
+        conversation_id: &str,
+        request: SubmitMessageRequest,
+    ) -> Result<MessageRecord> {
+        let _permit = self
+            .message_permits
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Error::RateLimited("message admission is saturated".to_string()))?;
+        let (session, conversation) = self
+            .authenticate_conversation(bearer_token, conversation_id, true)
+            .await?;
+        let current = now_ms();
+        self.message_rate_limiter
+            .check(&session.participant_address, current)
+            .await?;
+        self.submit_authorized_message(&session, conversation_id, conversation, request, current)
+            .await
+    }
+
+    async fn submit_authorized_message(
+        &self,
+        session: &AuthenticatedSession,
+        conversation_id: &str,
+        conversation: Conversation,
+        request: SubmitMessageRequest,
+        current: i64,
+    ) -> Result<MessageRecord> {
         let max_skew = (self.config.limits.message_clock_skew_secs as i64).saturating_mul(1_000);
         if current.abs_diff(request.client_timestamp_ms) > max_skew as u64 {
             return Err(Error::Invalid(
@@ -835,8 +1034,8 @@ impl ConversationService {
         };
         let insert_started = std::time::Instant::now();
         let outcome = self
-            .db
-            .insert_message(&NewMessage {
+            .message_ingest
+            .insert(NewMessage {
                 conversation_id: conversation_id.to_string(),
                 message_id: request.message_id,
                 sender: session.participant_address.clone(),
@@ -995,6 +1194,10 @@ impl ConversationService {
                 "zincha_conversation_message_retries_total {}\n",
                 "# TYPE zincha_conversation_message_insert_seconds_total counter\n",
                 "zincha_conversation_message_insert_seconds_total {:.6}\n",
+                "# TYPE zincha_conversation_message_batches_total counter\n",
+                "zincha_conversation_message_batches_total {}\n",
+                "# TYPE zincha_conversation_message_batch_messages_total counter\n",
+                "zincha_conversation_message_batch_messages_total {}\n",
                 "# TYPE zincha_conversation_authorization_refreshes_total counter\n",
                 "zincha_conversation_authorization_refreshes_total {}\n",
                 "# TYPE zincha_conversation_authorization_refresh_failures_total counter\n",
@@ -1031,6 +1234,8 @@ impl ConversationService {
             metrics.messages_inserted.load(Ordering::Relaxed),
             metrics.message_retries.load(Ordering::Relaxed),
             metrics.message_insert_micros.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+            metrics.message_batches.load(Ordering::Relaxed),
+            metrics.message_batch_messages.load(Ordering::Relaxed),
             metrics.authorization_refreshes.load(Ordering::Relaxed),
             metrics
                 .authorization_refresh_failures

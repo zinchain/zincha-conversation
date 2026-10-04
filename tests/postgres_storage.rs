@@ -152,10 +152,8 @@ async fn postgres_atomic_session_and_concurrent_message_retry() {
         1
     );
 
-    let mut distinct_attempts = Vec::new();
-    for index in 0..64_u64 {
-        let database = database.clone();
-        let message = NewMessage {
+    let distinct_messages = (0..64_u64)
+        .map(|index| NewMessage {
             conversation_id: conversation_id.clone(),
             message_id: Uuid::now_v7(),
             sender: participant.clone(),
@@ -167,22 +165,75 @@ async fn postgres_atomic_session_and_concurrent_message_retry() {
             payload_digest: hex::encode(Sha256::digest(index.to_be_bytes())),
             signing_key_id: delegation.delegation_id.to_string(),
             signature: "99".repeat(64),
-        };
-        distinct_attempts.push(tokio::spawn(async move {
-            database.insert_message(&message).await.unwrap()
-        }));
-    }
-    let mut sequences = Vec::new();
-    for attempt in distinct_attempts {
-        match attempt.await.unwrap() {
-            InsertMessageOutcome::Inserted(row) => sequences.push(row.sequence),
+        })
+        .collect::<Vec<_>>();
+    let mut sequences = database
+        .insert_messages(&distinct_messages)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|outcome| match outcome {
+            InsertMessageOutcome::Inserted(row) => row.sequence,
             InsertMessageOutcome::Existing(_) => {
                 panic!("a distinct message was treated as a retry")
+            }
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(sequences, (2..=65).collect::<Vec<_>>());
+    for (position, outcome) in database
+        .insert_messages(&distinct_messages)
+        .await
+        .unwrap()
+        .into_iter()
+        .enumerate()
+    {
+        match outcome {
+            InsertMessageOutcome::Existing(row) => {
+                assert_eq!(row.sequence, position as i64 + 2)
+            }
+            InsertMessageOutcome::Inserted(_) => panic!("a batch retry inserted a new message"),
+        }
+    }
+
+    let mut concurrent_batches = Vec::new();
+    for batch_index in 0..2_u64 {
+        let database = database.clone();
+        let conversation_id = conversation_id.clone();
+        let participant = participant.clone();
+        let signing_key_id = delegation.delegation_id.to_string();
+        concurrent_batches.push(tokio::spawn(async move {
+            let messages = (0..16_u64)
+                .map(|index| NewMessage {
+                    conversation_id: conversation_id.clone(),
+                    message_id: Uuid::now_v7(),
+                    sender: participant.clone(),
+                    client_timestamp_ms: timestamp,
+                    accepted_at_ms: timestamp,
+                    reply_to: None,
+                    key_epoch: Some(1),
+                    payload_blob: [batch_index.to_be_bytes(), index.to_be_bytes()].concat(),
+                    payload_digest: hex::encode(Sha256::digest(
+                        [batch_index.to_be_bytes(), index.to_be_bytes()].concat(),
+                    )),
+                    signing_key_id: signing_key_id.clone(),
+                    signature: "99".repeat(64),
+                })
+                .collect::<Vec<_>>();
+            database.insert_messages(&messages).await.unwrap()
+        }));
+    }
+    for batch in concurrent_batches {
+        for outcome in batch.await.unwrap() {
+            match outcome {
+                InsertMessageOutcome::Inserted(row) => sequences.push(row.sequence),
+                InsertMessageOutcome::Existing(_) => {
+                    panic!("a distinct concurrent batch message was treated as a retry")
+                }
             }
         }
     }
     sequences.sort_unstable();
-    assert_eq!(sequences, (2..=65).collect::<Vec<_>>());
+    assert_eq!(sequences, (2..=97).collect::<Vec<_>>());
 
     if let Database::Postgres(pool) = database {
         let (message_count, event_count, next_sequence): (i64, i64, i64) = sqlx::query_as(
@@ -195,7 +246,7 @@ async fn postgres_atomic_session_and_concurrent_message_retry() {
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!((message_count, event_count, next_sequence), (65, 65, 66));
+        assert_eq!((message_count, event_count, next_sequence), (97, 97, 98));
         let mismatched_events: i64 = sqlx::query_scalar(
             "SELECT COUNT(*)
                FROM conversation_events AS event

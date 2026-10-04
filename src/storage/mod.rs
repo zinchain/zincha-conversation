@@ -79,6 +79,10 @@ pub enum InsertMessageOutcome {
 }
 
 impl Database {
+    pub fn is_postgres(&self) -> bool {
+        matches!(self, Self::Postgres(_))
+    }
+
     pub async fn connect(url: &str, max_connections: u32) -> Result<Self> {
         if url.starts_with("sqlite:") {
             let options = SqliteConnectOptions::from_str(url)
@@ -391,6 +395,78 @@ impl Database {
         }
     }
 
+    pub async fn authenticate_session_conversation(
+        &self,
+        token_hash: &[u8],
+        current_time_ms: i64,
+    ) -> Result<(AuthenticatedSession, Option<Conversation>)> {
+        match self {
+            Self::Sqlite(pool) => {
+                let row = sqlx::query(
+                    "SELECT s.tenant_id, s.conversation_id, s.participant_address,
+                            s.delegation_id, s.expires_at_ms,
+                            d.operational_signing_key, d.can_read, d.can_write,
+                            c.id AS authorized_conversation_id,
+                            c.tenant_id AS conversation_tenant_id,
+                            c.subject_json AS conversation_subject_json,
+                            c.home_service_id AS conversation_home_service_id,
+                            c.privacy_mode AS conversation_privacy_mode,
+                            c.snapshot_json AS conversation_snapshot_json,
+                            c.created_at_ms AS conversation_created_at_ms,
+                            c.updated_at_ms AS conversation_updated_at_ms
+                       FROM sessions AS s
+                       JOIN delegations AS d ON d.id = s.delegation_id
+                  LEFT JOIN conversations AS c ON c.id = s.conversation_id
+                      WHERE s.token_hash = ? AND s.expires_at_ms > ?
+                        AND d.expires_at_ms > ? AND d.revoked_at_ms IS NULL",
+                )
+                .bind(token_hash)
+                .bind(current_time_ms)
+                .bind(current_time_ms)
+                .fetch_optional(pool)
+                .await?
+                .ok_or_else(|| {
+                    Error::Authentication("session is missing, expired, or revoked".to_string())
+                })?;
+                Ok((
+                    session_from_sqlite(&row)?,
+                    authorized_conversation_from_sqlite(&row)?,
+                ))
+            }
+            Self::Postgres(pool) => {
+                let row = sqlx::query(
+                    "SELECT s.tenant_id, s.conversation_id, s.participant_address,
+                            s.delegation_id, s.expires_at_ms,
+                            d.operational_signing_key, d.can_read, d.can_write,
+                            c.id AS authorized_conversation_id,
+                            c.tenant_id AS conversation_tenant_id,
+                            c.subject_json AS conversation_subject_json,
+                            c.home_service_id AS conversation_home_service_id,
+                            c.privacy_mode AS conversation_privacy_mode,
+                            c.snapshot_json AS conversation_snapshot_json,
+                            c.created_at_ms AS conversation_created_at_ms,
+                            c.updated_at_ms AS conversation_updated_at_ms
+                       FROM sessions AS s
+                       JOIN delegations AS d ON d.id = s.delegation_id
+                  LEFT JOIN conversations AS c ON c.id = s.conversation_id
+                      WHERE s.token_hash = $1 AND s.expires_at_ms > $2
+                        AND d.expires_at_ms > $2 AND d.revoked_at_ms IS NULL",
+                )
+                .bind(token_hash)
+                .bind(current_time_ms)
+                .fetch_optional(pool)
+                .await?
+                .ok_or_else(|| {
+                    Error::Authentication("session is missing, expired, or revoked".to_string())
+                })?;
+                Ok((
+                    session_from_postgres(&row)?,
+                    authorized_conversation_from_postgres(&row)?,
+                ))
+            }
+        }
+    }
+
     pub async fn delegation_has_read_access(&self, id: Uuid, current_time_ms: i64) -> Result<()> {
         let active = match self {
             Self::Sqlite(pool) => {
@@ -463,6 +539,25 @@ impl Database {
         match self {
             Self::Sqlite(pool) => insert_message_sqlite(pool, message).await,
             Self::Postgres(pool) => insert_message_postgres(pool, message).await,
+        }
+    }
+
+    pub async fn insert_messages(
+        &self,
+        messages: &[NewMessage],
+    ) -> Result<Vec<InsertMessageOutcome>> {
+        if messages.is_empty() {
+            return Ok(Vec::new());
+        }
+        match self {
+            Self::Postgres(pool) => insert_messages_postgres(pool, messages).await,
+            Self::Sqlite(_) => {
+                let mut outcomes = Vec::with_capacity(messages.len());
+                for message in messages {
+                    outcomes.push(self.insert_message(message).await?);
+                }
+                Ok(outcomes)
+            }
         }
     }
 
@@ -718,6 +813,46 @@ fn conversation_from_postgres(id: &str, row: &PgRow) -> Result<Conversation> {
     })
 }
 
+fn authorized_conversation_from_sqlite(row: &SqliteRow) -> Result<Option<Conversation>> {
+    let Some(id) = row.try_get::<Option<String>, _>("authorized_conversation_id")? else {
+        return Ok(None);
+    };
+    let subject: String = row.try_get("conversation_subject_json")?;
+    let snapshot: String = row.try_get("conversation_snapshot_json")?;
+    Ok(Some(Conversation {
+        id,
+        tenant_id: row.try_get("conversation_tenant_id")?,
+        subject: serde_json::from_str(&subject)?,
+        home_service_id: row.try_get("conversation_home_service_id")?,
+        privacy_mode: parse_privacy(
+            row.try_get::<String, _>("conversation_privacy_mode")?
+                .as_str(),
+        )?,
+        snapshot: serde_json::from_str(&snapshot)?,
+        created_at_ms: row.try_get("conversation_created_at_ms")?,
+        updated_at_ms: row.try_get("conversation_updated_at_ms")?,
+    }))
+}
+
+fn authorized_conversation_from_postgres(row: &PgRow) -> Result<Option<Conversation>> {
+    let Some(id) = row.try_get::<Option<String>, _>("authorized_conversation_id")? else {
+        return Ok(None);
+    };
+    Ok(Some(Conversation {
+        id,
+        tenant_id: row.try_get("conversation_tenant_id")?,
+        subject: serde_json::from_value(row.try_get("conversation_subject_json")?)?,
+        home_service_id: row.try_get("conversation_home_service_id")?,
+        privacy_mode: parse_privacy(
+            row.try_get::<String, _>("conversation_privacy_mode")?
+                .as_str(),
+        )?,
+        snapshot: serde_json::from_value(row.try_get("conversation_snapshot_json")?)?,
+        created_at_ms: row.try_get("conversation_created_at_ms")?,
+        updated_at_ms: row.try_get("conversation_updated_at_ms")?,
+    }))
+}
+
 fn message_from_sqlite(conversation_id: &str, row: &SqliteRow) -> Result<StoredMessage> {
     message_from_values(
         conversation_id,
@@ -852,6 +987,108 @@ async fn insert_message_postgres(
     } else {
         InsertMessageOutcome::Existing(stored)
     })
+}
+
+async fn insert_messages_postgres(
+    pool: &PgPool,
+    messages: &[NewMessage],
+) -> Result<Vec<InsertMessageOutcome>> {
+    let conversation_id = &messages[0].conversation_id;
+    if messages
+        .iter()
+        .any(|message| message.conversation_id != *conversation_id)
+    {
+        return Err(Error::Internal(
+            "a PostgreSQL message batch crossed conversation boundaries".to_string(),
+        ));
+    }
+
+    let message_ids = messages
+        .iter()
+        .map(|message| message.message_id.to_string())
+        .collect::<Vec<_>>();
+    let accepted_at_ms = messages
+        .iter()
+        .map(|message| message.accepted_at_ms)
+        .collect::<Vec<_>>();
+    let senders = messages
+        .iter()
+        .map(|message| message.sender.clone())
+        .collect::<Vec<_>>();
+    let client_timestamp_ms = messages
+        .iter()
+        .map(|message| message.client_timestamp_ms)
+        .collect::<Vec<_>>();
+    let reply_to = messages
+        .iter()
+        .map(|message| message.reply_to.map(|id| id.to_string()))
+        .collect::<Vec<_>>();
+    let key_epoch = messages
+        .iter()
+        .map(|message| message.key_epoch)
+        .collect::<Vec<_>>();
+    let payload_blobs = messages
+        .iter()
+        .map(|message| message.payload_blob.clone())
+        .collect::<Vec<_>>();
+    let payload_digests = messages
+        .iter()
+        .map(|message| message.payload_digest.clone())
+        .collect::<Vec<_>>();
+    let signing_key_ids = messages
+        .iter()
+        .map(|message| message.signing_key_id.clone())
+        .collect::<Vec<_>>();
+    let signatures = messages
+        .iter()
+        .map(|message| message.signature.clone())
+        .collect::<Vec<_>>();
+
+    let rows = sqlx::query(
+        "SELECT * FROM zincha_insert_message_batch_v1($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+    )
+    .bind(conversation_id)
+    .bind(message_ids)
+    .bind(accepted_at_ms)
+    .bind(senders)
+    .bind(client_timestamp_ms)
+    .bind(reply_to)
+    .bind(key_epoch)
+    .bind(payload_blobs)
+    .bind(payload_digests)
+    .bind(signing_key_ids)
+    .bind(signatures)
+    .fetch_all(pool)
+    .await?;
+    if rows.is_empty() {
+        return Err(Error::NotFound("conversation not found".to_string()));
+    }
+    if rows.len() != messages.len() {
+        return Err(Error::Internal(
+            "PostgreSQL returned an incomplete message batch".to_string(),
+        ));
+    }
+
+    rows.into_iter()
+        .zip(messages)
+        .enumerate()
+        .map(|(position, (row, message))| {
+            let input_index: i32 = row.try_get("input_index")?;
+            if input_index != (position + 1) as i32 {
+                return Err(Error::Internal(
+                    "PostgreSQL returned a reordered message batch".to_string(),
+                ));
+            }
+            let inserted: bool = row.try_get("was_inserted")?;
+            let stored = message_from_postgres(conversation_id, &row)?;
+            validate_idempotent(&stored, message)?;
+            Ok(if inserted {
+                InsertMessageOutcome::Inserted(stored)
+            } else {
+                InsertMessageOutcome::Existing(stored)
+            })
+        })
+        .collect()
 }
 
 fn validate_idempotent(existing: &StoredMessage, message: &NewMessage) -> Result<()> {

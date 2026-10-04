@@ -52,6 +52,12 @@ fn default_challenge_rate_global() -> u32 {
 fn default_message_inflight() -> usize {
     256
 }
+fn default_message_batch_max() -> usize {
+    16
+}
+fn default_message_batch_linger_micros() -> u64 {
+    2_000
+}
 fn default_message_clock_skew() -> u64 {
     10 * 60
 }
@@ -189,6 +195,10 @@ pub struct LimitsConfig {
     pub challenges_per_second_global: u32,
     #[serde(default = "default_message_inflight")]
     pub max_inflight_messages: usize,
+    #[serde(default = "default_message_batch_max")]
+    pub message_batch_max_messages: usize,
+    #[serde(default = "default_message_batch_linger_micros")]
+    pub message_batch_linger_micros: u64,
     #[serde(default = "default_message_clock_skew")]
     pub message_clock_skew_secs: u64,
     #[serde(default = "default_sse_buffer")]
@@ -218,6 +228,8 @@ impl Default for LimitsConfig {
             challenges_per_minute_per_address: default_challenge_rate_per_address(),
             challenges_per_second_global: default_challenge_rate_global(),
             max_inflight_messages: default_message_inflight(),
+            message_batch_max_messages: default_message_batch_max(),
+            message_batch_linger_micros: default_message_batch_linger_micros(),
             message_clock_skew_secs: default_message_clock_skew(),
             sse_buffer_messages: default_sse_buffer(),
             max_sse_connections: default_sse_connections(),
@@ -456,6 +468,7 @@ impl Config {
             || self.limits.challenges_per_minute_per_address == 0
             || self.limits.challenges_per_second_global == 0
             || self.limits.max_inflight_messages == 0
+            || self.limits.message_batch_max_messages == 0
             || self.limits.sse_buffer_messages == 0
             || self.limits.max_sse_connections == 0
             || self.limits.max_inflight_sse_replays == 0
@@ -474,6 +487,9 @@ impl Config {
             || self.limits.max_sse_connections > 100_000
             || self.limits.max_inflight_sse_replays > 4_096
             || self.limits.max_inflight_messages > 65_536
+            || self.limits.message_batch_max_messages > 256
+            || self.limits.message_batch_max_messages > self.limits.max_inflight_messages
+            || self.limits.message_batch_linger_micros > 10_000
             || self.limits.max_concurrent_requests > 65_536
             || self.limits.maintenance_batch_rows > 100_000
         {
@@ -666,6 +682,15 @@ backups_secs = 1
     fn limits_reject_unbounded_replay_and_noncanonical_grace() {
         let mut config = example();
         config.limits.max_inflight_sse_replays = 0;
+        assert!(config.validate().is_err());
+
+        let mut config = example();
+        config.limits.message_batch_max_messages =
+            config.limits.max_inflight_messages.saturating_add(1);
+        assert!(config.validate().is_err());
+
+        let mut config = example();
+        config.limits.message_batch_linger_micros = 10_001;
         assert!(config.validate().is_err());
 
         let mut config = example();

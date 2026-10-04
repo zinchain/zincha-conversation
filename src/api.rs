@@ -182,11 +182,11 @@ async fn submit_message(
     Path(conversation_id): Path<String>,
     Json(request): Json<SubmitMessageRequest>,
 ) -> Result<impl IntoResponse> {
-    let session = service.authenticate(bearer(&headers)?).await?;
+    let bearer_token = bearer(&headers)?;
     Ok((
         StatusCode::CREATED,
         ok(service
-            .submit_message(&session, &conversation_id, request)
+            .submit_authenticated_message(bearer_token, &conversation_id, request)
             .await?),
     ))
 }
