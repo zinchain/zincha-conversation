@@ -239,11 +239,15 @@ components:
     ConversationProfile:
       type: object
       additionalProperties: false
-      required: [version, service_id, discovery_url, privacy_modes, protocol_versions, service_signing_public_key]
+      required: [version, service_id, interfaces, privacy_modes, protocol_versions]
       properties:
-        version: { const: 1 }
+        version: { const: 2 }
         service_id: { type: string, minLength: 1, maxLength: 256 }
-        discovery_url: { type: string, format: uri, maxLength: 2048 }
+        interfaces:
+          type: array
+          minItems: 1
+          maxItems: 4
+          items: { $ref: "#/components/schemas/ConversationInterface" }
         privacy_modes:
           type: array
           minItems: 1
@@ -256,7 +260,48 @@ components:
           maxItems: 64
           uniqueItems: true
           items: { type: integer, minimum: 1 }
-        service_signing_public_key: { type: string, pattern: "^[0-9a-f]{64}$" }
+    ConversationInterface:
+      oneOf:
+        - $ref: "#/components/schemas/HttpsConversationInterface"
+        - $ref: "#/components/schemas/ZinchaTlsV1ConversationInterface"
+      discriminator:
+        propertyName: type
+        mapping:
+          https: "#/components/schemas/HttpsConversationInterface"
+          zincha_tls_v1: "#/components/schemas/ZinchaTlsV1ConversationInterface"
+    HttpsConversationInterface:
+      type: object
+      additionalProperties: false
+      required: [type, url]
+      properties:
+        type: { const: https }
+        url: { type: string, format: uri, maxLength: 2048 }
+    ZinchaTlsV1ConversationInterface:
+      type: object
+      additionalProperties: false
+      required: [type, host, port, certificate_pins]
+      properties:
+        type: { const: zincha_tls_v1 }
+        host:
+          type: string
+          anyOf:
+            - { format: ipv4 }
+            - { format: ipv6 }
+        port: { type: integer, minimum: 1, maximum: 65535, default: 443 }
+        certificate_pins:
+          type: array
+          minItems: 1
+          maxItems: 2
+          uniqueItems: true
+          items: { $ref: "#/components/schemas/TlsCertificatePin" }
+    TlsCertificatePin:
+      type: object
+      additionalProperties: false
+      required: [sha256, not_before_ms, not_after_ms]
+      properties:
+        sha256: { type: string, pattern: "^[0-9a-f]{64}$" }
+        not_before_ms: { type: integer, format: int64 }
+        not_after_ms: { type: integer, format: int64 }
     ProfileResponse:
       allOf:
         - $ref: "#/components/schemas/SuccessEnvelope"

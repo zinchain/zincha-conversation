@@ -7,7 +7,7 @@ procedure passes on the declared production topology.
 
 ## Fixed topology and evidence
 
-Use the intended production database and TLS proxy. Record the service commit,
+Use the intended production database and each advertised transport. Record the service commit,
 Rust version, lockfile hash, optimized binary hash, configuration hash, schema
 version, host shape, database shape, kernel, and start/end timestamps. Keep
 secrets outside the evidence bundle.
@@ -21,7 +21,8 @@ For every run capture:
 - PostgreSQL transaction rate, commit latency, connection occupancy, WAL rate,
   table/index growth, lock waits, checkpoints, and storage throttling;
 - retention rows eligible, visited, and deleted before and after the run;
-- reverse-proxy connection count, rejection count, and network errors.
+- reverse-proxy connection count, direct-TLS active connections, handshakes,
+  failures, timeouts and cumulative latency, rejection count, and network errors.
 
 Do not repair or omit a failed observation. A missing metric or incomplete
 sequence span is an inconclusive run.
@@ -41,6 +42,12 @@ Exercise backup restore with the exact payload-master-key version. After
 restore, verify authentication, encrypted payload reads, idempotent retry, SSE
 resume, revocation, and retention on the restored database.
 
+Run the correctness matrix independently through Web-PKI HTTPS and
+`zincha-tls-v1`, then with mixed API/SSE traffic. Verify TLS 1.2, plaintext,
+early data, malformed/expired/future/removed pins, wrong service IDs, and stale
+live profiles fail before credentials or workflow identifiers are sent. Run
+the old-only, overlap, new-active, and old-removed certificate-rotation phases.
+
 ## Message-throughput gate
 
 Prepare a fresh workflow/conversation and a delegation that remains valid for
@@ -48,7 +55,28 @@ the complete run. Put this private input in a mode-0600 file:
 
 ```json
 {
-  "base_url": "https://conversations.example.com",
+  "profile": {
+    "version": 2,
+    "service_id": "provider-agent/conversations",
+    "interfaces": [
+      {
+        "type": "zincha_tls_v1",
+        "host": "203.0.113.25",
+        "port": 443,
+        "certificate_pins": [
+          {
+            "sha256": "<64-lowercase-hex-leaf-certificate-fingerprint>",
+            "not_before_ms": 1791000000000,
+            "not_after_ms": 1822536000000
+          }
+        ]
+      },
+      { "type": "https", "url": "https://conversations.example.com" }
+    ],
+    "privacy_modes": ["platform_readable", "end_to_end"],
+    "protocol_versions": [1]
+  },
+  "transport_policy": "zincha_tls_only",
   "provider_address": "zn1...",
   "delegation": { "version": 1 },
   "operational_secret_hex": "<32-byte-secret>",
@@ -84,6 +112,17 @@ no growing eligible retention/event backlog. The service and database resource
 observations must remain within the deployment's predeclared CPU, RSS, latency,
 and storage budgets.
 
+Repeat this 30-minute gate for HTTPS-only, pinned-TLS-only, and predeclared
+mixed traffic. Compare CPU seconds per accepted message and warmed/high-water
+RSS with the unchanged HTTP application baseline; any material regression or
+growing handshake/backlog debt leaves qualification pending.
+
+The driver consumes the authenticated on-chain profile and verifies the live
+`/v1/profile` response before requesting a challenge. Set `transport_policy`
+to `https_only` or `zincha_tls_only` for the isolated arms. Run both predeclared
+arms concurrently for the mixed arm; do not use `auto` to manufacture a mixed
+workload. `auto` is for ordered reachability fallback testing.
+
 ## SSE connection and fan-out gate
 
 Use two fresh workflows so the idle population does not receive traffic meant
@@ -92,7 +131,28 @@ the ramp plus hold interval. Each mode-0600 input has this form:
 
 ```json
 {
-  "base_url": "https://conversations.example.com",
+  "profile": {
+    "version": 2,
+    "service_id": "provider-agent/conversations",
+    "interfaces": [
+      {
+        "type": "zincha_tls_v1",
+        "host": "203.0.113.25",
+        "port": 443,
+        "certificate_pins": [
+          {
+            "sha256": "<64-lowercase-hex-leaf-certificate-fingerprint>",
+            "not_before_ms": 1791000000000,
+            "not_after_ms": 1822536000000
+          }
+        ]
+      },
+      { "type": "https", "url": "https://conversations.example.com" }
+    ],
+    "privacy_modes": ["platform_readable", "end_to_end"],
+    "protocol_versions": [1]
+  },
+  "transport_policy": "zincha_tls_only",
   "conversation_id": "<64-lowercase-hex>",
   "access_token": "<short-lived-token>",
   "connections": 9900,
@@ -122,6 +182,11 @@ and the expected message event count for the active subset. RSS must reach a
 bounded plateau. Reconnect the population in a predeclared ramp after a proxy
 restart and verify that replay concurrency stays within configuration and
 ordinary API requests remain responsive.
+
+Repeat connection churn during a certificate overlap and after the old pin is
+removed. Existing pooled sessions may finish under an advertised pin; new
+connections must observe the current on-chain pin set, and retired-pin session
+resumption must not succeed.
 
 ## Authorization and retention gates
 

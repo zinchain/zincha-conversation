@@ -20,7 +20,7 @@ use zincha_conversation::{
     chain::AuthorizationSource,
     config::{
         ChainConfig, ChainSignerConfig, DatabaseConfig, EncryptionConfig, LimitsConfig,
-        RetentionConfig, ServiceConfig,
+        RetentionConfig, ServiceConfig, ServiceInterfaceConfig,
     },
     crypto::{
         address_from_public_key, challenge_signing_bytes, delegation_signing_bytes,
@@ -127,10 +127,10 @@ async fn fixture() -> Fixture {
         listen: "127.0.0.1:0".parse().unwrap(),
         service: ServiceConfig {
             service_id: "marketplace.example/conversations".to_string(),
-            public_url: "https://conversation.example".to_string(),
             tenant_id: "marketplace".to_string(),
-            service_signing_public_key:
-                "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c".to_string(),
+            interfaces: vec![ServiceInterfaceConfig::Https {
+                url: "https://conversation.example".to_string(),
+            }],
             privacy_modes: vec![PrivacyMode::PlatformReadable, PrivacyMode::EndToEnd],
             allowed_origins: vec!["https://marketplace.example".to_string()],
         },

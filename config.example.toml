@@ -2,11 +2,25 @@ listen = "127.0.0.1:9988"
 
 [service]
 service_id = "marketplace.example/conversations"
-public_url = "https://conversations.marketplace.example"
 tenant_id = "marketplace-example"
-service_signing_public_key = "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c"
 privacy_modes = ["platform_readable", "end_to_end"]
 allowed_origins = ["https://marketplace.example"]
+
+# Keep interfaces in provider-preference order. A direct zincha_tls_v1 listener
+# normally comes first. It may bind an unprivileged internal port while a
+# container, router, or systemd maps public TCP 443 to it.
+#[[service.interfaces]]
+#type = "zincha_tls_v1"
+#host = "203.0.113.25"
+#port = 443
+#listen = "0.0.0.0:8443"
+#certificate_file = "/etc/zincha-conversation/tls/certificate.pem"
+#private_key_file = "/run/secrets/zincha-conversation-tls-key.pem"
+#next_certificate_file = "/etc/zincha-conversation/tls/next-certificate.pem"
+
+[[service.interfaces]]
+type = "https"
+url = "https://conversations.marketplace.example"
 
 [database]
 # Use PostgreSQL for multi-instance production deployments. SQLite WAL mode is

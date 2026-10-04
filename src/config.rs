@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, net::SocketAddr, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    net::{IpAddr, SocketAddr},
+    path::PathBuf,
+};
 
 use serde::Deserialize;
 
@@ -9,6 +13,12 @@ use crate::{
 
 fn default_listen() -> SocketAddr {
     "127.0.0.1:9988".parse().expect("literal socket")
+}
+fn default_zincha_tls_port() -> u16 {
+    443
+}
+fn default_zincha_tls_listen() -> SocketAddr {
+    "0.0.0.0:443".parse().expect("literal socket")
 }
 fn default_challenge_ttl() -> u64 {
     300
@@ -87,14 +97,31 @@ pub struct Config {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServiceConfig {
     pub service_id: String,
-    pub public_url: String,
     #[serde(default = "default_tenant")]
     pub tenant_id: String,
-    pub service_signing_public_key: String,
+    pub interfaces: Vec<ServiceInterfaceConfig>,
     #[serde(default = "default_privacy_modes")]
     pub privacy_modes: Vec<PrivacyMode>,
     #[serde(default)]
     pub allowed_origins: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ServiceInterfaceConfig {
+    Https {
+        url: String,
+    },
+    ZinchaTlsV1 {
+        host: String,
+        #[serde(default = "default_zincha_tls_port")]
+        port: u16,
+        #[serde(default = "default_zincha_tls_listen")]
+        listen: SocketAddr,
+        certificate_file: PathBuf,
+        private_key_file: PathBuf,
+        next_certificate_file: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -227,18 +254,74 @@ impl Config {
                 "service_id and tenant_id cannot contain control characters".to_string(),
             ));
         }
-        let public_url = url::Url::parse(&self.service.public_url).ok();
-        if !public_url.as_ref().is_some_and(|url| {
-            url.host_str().is_some()
-                && url.username().is_empty()
-                && url.password().is_none()
-                && url.query().is_none()
-                && url.fragment().is_none()
-                && (url.scheme() == "https"
-                    || (url.scheme() == "http" && url.host_str().is_some_and(is_loopback_hostname)))
-        }) {
+        if self.service.interfaces.is_empty() || self.service.interfaces.len() > 4 {
             return Err(Error::Invalid(
-                "public_url must use HTTPS, except for loopback development".to_string(),
+                "service must advertise between one and four interfaces".to_string(),
+            ));
+        }
+        let mut advertised = BTreeSet::new();
+        let mut zincha_tls_count = 0usize;
+        for interface in &self.service.interfaces {
+            let identity = match interface {
+                ServiceInterfaceConfig::Https { url } => {
+                    let parsed = url::Url::parse(url).map_err(|_| {
+                        Error::Invalid("HTTPS interface URL is invalid".to_string())
+                    })?;
+                    if parsed.scheme() != "https"
+                        || parsed.host_str().is_none()
+                        || !parsed.username().is_empty()
+                        || parsed.password().is_some()
+                        || parsed.query().is_some()
+                        || parsed.fragment().is_some()
+                    {
+                        return Err(Error::Invalid(
+                            "HTTPS interface must be an absolute HTTPS URL without credentials, query, or fragment"
+                                .to_string(),
+                        ));
+                    }
+                    format!("https:{url}")
+                }
+                ServiceInterfaceConfig::ZinchaTlsV1 {
+                    host,
+                    port,
+                    certificate_file,
+                    private_key_file,
+                    next_certificate_file,
+                    ..
+                } => {
+                    zincha_tls_count += 1;
+                    let ip: IpAddr = host.parse().map_err(|_| {
+                        Error::Invalid(
+                            "zincha_tls_v1 host must be a literal IPv4 or IPv6 address".to_string(),
+                        )
+                    })?;
+                    if host != &ip.to_string() || *port == 0 {
+                        return Err(Error::Invalid(
+                            "zincha_tls_v1 host must be canonical and port must be non-zero"
+                                .to_string(),
+                        ));
+                    }
+                    if certificate_file == private_key_file
+                        || next_certificate_file.as_ref().is_some_and(|next| {
+                            next == certificate_file || next == private_key_file
+                        })
+                    {
+                        return Err(Error::Invalid(
+                            "zincha_tls_v1 certificate and key paths must be distinct".to_string(),
+                        ));
+                    }
+                    format!("zincha_tls_v1:{ip}:{port}")
+                }
+            };
+            if !advertised.insert(identity) {
+                return Err(Error::Invalid(
+                    "service interfaces must be unique".to_string(),
+                ));
+            }
+        }
+        if zincha_tls_count > 1 {
+            return Err(Error::Invalid(
+                "only one direct zincha_tls_v1 listener is supported".to_string(),
             ));
         }
         if self.service.privacy_modes.is_empty()
@@ -275,15 +358,6 @@ impl Config {
                     "allowed origin must contain only an HTTP(S) scheme and authority: {origin}"
                 )));
             }
-        }
-        let service_key = hex::decode(&self.service.service_signing_public_key)
-            .ok()
-            .and_then(|bytes| bytes.try_into().ok())
-            .and_then(|bytes| ed25519_dalek::VerifyingKey::from_bytes(&bytes).ok());
-        if service_key.is_none() {
-            return Err(Error::Invalid(
-                "service_signing_public_key must be a valid hexadecimal Ed25519 key".to_string(),
-            ));
         }
         const MAX_DURATION_SECS: u64 = 10 * 365 * 24 * 60 * 60;
         if self.retention.messages_after_terminal_secs == 0
@@ -446,7 +520,9 @@ mod tests {
         config.validate().unwrap();
 
         let mut insecure_public = config.clone();
-        insecure_public.service.public_url = "http://conversations.example".into();
+        insecure_public.service.interfaces = vec![ServiceInterfaceConfig::Https {
+            url: "http://conversations.example".into(),
+        }];
         assert!(insecure_public.validate().is_err());
 
         let mut insecure_rpc = config.clone();
@@ -454,7 +530,9 @@ mod tests {
         assert!(insecure_rpc.validate().is_err());
 
         let mut credentialed = config;
-        credentialed.service.public_url = "https://user:secret@conversations.example".into();
+        credentialed.service.interfaces = vec![ServiceInterfaceConfig::Https {
+            url: "https://user:secret@conversations.example".into(),
+        }];
         assert!(credentialed.validate().is_err());
 
         let mut insecure_origin = example();
@@ -468,6 +546,53 @@ mod tests {
         let mut non_root_rpc = example();
         non_root_rpc.chain.rpc_url = "https://rpc.example/v1".into();
         assert!(non_root_rpc.validate().is_err());
+    }
+
+    #[test]
+    fn direct_tls_requires_canonical_literal_ip_and_defaults_to_443() {
+        let parsed: Config = toml::from_str(
+            r#"
+listen = "127.0.0.1:9988"
+[service]
+service_id = "provider-agent/conversations"
+tenant_id = "provider"
+[[service.interfaces]]
+type = "zincha_tls_v1"
+host = "2001:db8::25"
+certificate_file = "/tmp/cert.pem"
+private_key_file = "/tmp/key.pem"
+[database]
+url = "sqlite::memory:"
+[chain]
+rpc_url = "http://127.0.0.1:9944"
+network = "testnet"
+chain_id = "test"
+[chain.provider_signers."zn10000000000000000000000000000000000000001"]
+type = "local_file"
+secret_key_file = "/tmp/provider.key"
+[encryption]
+local_master_key_file = "/tmp/master.key"
+[retention]
+messages_after_terminal_secs = 1
+artifacts_after_terminal_secs = 1
+audit_secs = 1
+backups_secs = 1
+"#,
+        )
+        .unwrap();
+        match &parsed.service.interfaces[0] {
+            ServiceInterfaceConfig::ZinchaTlsV1 { port, .. } => assert_eq!(*port, 443),
+            _ => panic!("expected direct TLS interface"),
+        }
+        parsed.validate().unwrap();
+
+        let mut noncanonical = parsed;
+        if let ServiceInterfaceConfig::ZinchaTlsV1 { host, .. } =
+            &mut noncanonical.service.interfaces[0]
+        {
+            *host = "2001:0db8::25".to_string();
+        }
+        assert!(noncanonical.validate().is_err());
     }
 
     #[test]

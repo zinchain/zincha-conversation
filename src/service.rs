@@ -1,12 +1,17 @@
 use std::{
     collections::{hash_map::RandomState, HashMap},
+    future::Future,
     hash::BuildHasher,
+    io,
+    pin::Pin,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
+    task::{Context, Poll},
 };
 
+use axum_server::{accept::Accept, tls_rustls::RustlsAcceptor};
 use tokio::sync::{broadcast, Mutex, Notify, OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 
@@ -19,17 +24,22 @@ use crate::{
     },
     error::{Error, Result},
     model::{
-        AuthenticatedSession, ChallengeRequest, ChallengeResponse, Conversation, MessagePayload,
-        MessageRecord, Page, PrivacyMode, ResolveConversationRequest, SessionRequest,
-        SessionResponse, SubjectRef, SubjectSnapshot, SubmitMessageRequest,
+        AuthenticatedSession, ChallengeRequest, ChallengeResponse, Conversation,
+        ConversationProfileV2, MessagePayload, MessageRecord, Page, PrivacyMode,
+        ResolveConversationRequest, SessionRequest, SessionResponse, SubjectRef, SubjectSnapshot,
+        SubmitMessageRequest,
     },
     storage::{Database, InsertMessageOutcome, NewMessage, StoredChallenge, StoredMessage},
+    transport,
 };
 
 #[derive(Clone)]
 pub struct ConversationService {
     pub config: Arc<Config>,
     pub db: Database,
+    profile: Arc<ConversationProfileV2>,
+    direct_tls: Option<transport::PreparedDirectTls>,
+    ready: Arc<AtomicBool>,
     authorization: Arc<dyn AuthorizationSource>,
     master_key: LocalMasterKey,
     streams: Arc<Mutex<HashMap<String, broadcast::Sender<MessageRecord>>>>,
@@ -55,12 +65,134 @@ struct ServiceMetrics {
     maintenance_rows_removed: AtomicU64,
     event_loop_lag_micros: AtomicU64,
     event_loop_lag_max_micros: AtomicU64,
+    tls_active_connections: AtomicU64,
+    tls_handshakes: AtomicU64,
+    tls_handshake_failures: AtomicU64,
+    tls_handshake_timeouts: AtomicU64,
+    tls_handshake_micros: AtomicU64,
 }
 
 #[derive(Default)]
 struct RefreshFlight {
     result: Mutex<Option<std::result::Result<Conversation, ()>>>,
     completed: Notify,
+}
+
+#[derive(Clone)]
+struct BoundedTlsAcceptor {
+    inner: RustlsAcceptor,
+    permits: Arc<Semaphore>,
+    metrics: Arc<ServiceMetrics>,
+}
+
+impl BoundedTlsAcceptor {
+    fn new(inner: RustlsAcceptor, limit: usize, metrics: Arc<ServiceMetrics>) -> Self {
+        Self {
+            inner,
+            permits: Arc::new(Semaphore::new(limit)),
+            metrics,
+        }
+    }
+}
+
+struct TrackedTlsStream<T> {
+    inner: T,
+    metrics: Arc<ServiceMetrics>,
+}
+
+impl<T> Drop for TrackedTlsStream<T> {
+    fn drop(&mut self) {
+        self.metrics
+            .tls_active_connections
+            .fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+impl<T: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for TrackedTlsStream<T> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(context, buffer)
+    }
+}
+
+impl<T: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for TrackedTlsStream<T> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(context, buffer)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(context)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(context)
+    }
+}
+
+impl<I, S> Accept<I, S> for BoundedTlsAcceptor
+where
+    I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    S: Send + 'static,
+    <RustlsAcceptor as Accept<I, S>>::Future: Send + 'static,
+{
+    type Stream = TrackedTlsStream<<RustlsAcceptor as Accept<I, S>>::Stream>;
+    type Service = S;
+    type Future = Pin<Box<dyn Future<Output = io::Result<(Self::Stream, S)>> + Send>>;
+
+    fn accept(&self, stream: I, service: S) -> Self::Future {
+        let permits = self.permits.clone();
+        let inner = self.inner.clone();
+        let metrics = self.metrics.clone();
+        Box::pin(async move {
+            let _permit = permits.try_acquire_owned().map_err(|_| {
+                metrics
+                    .tls_handshake_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "TLS handshake capacity exhausted",
+                )
+            })?;
+            let started = std::time::Instant::now();
+            metrics.tls_handshakes.fetch_add(1, Ordering::Relaxed);
+            match inner.accept(stream, service).await {
+                Ok((stream, service)) => {
+                    metrics.tls_handshake_micros.fetch_add(
+                        started.elapsed().as_micros().min(u64::MAX as u128) as u64,
+                        Ordering::Relaxed,
+                    );
+                    metrics
+                        .tls_active_connections
+                        .fetch_add(1, Ordering::Relaxed);
+                    Ok((
+                        TrackedTlsStream {
+                            inner: stream,
+                            metrics,
+                        },
+                        service,
+                    ))
+                }
+                Err(error) => {
+                    metrics
+                        .tls_handshake_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                    if error.kind() == io::ErrorKind::TimedOut {
+                        metrics
+                            .tls_handshake_timeouts
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(error)
+                }
+            }
+        })
+    }
 }
 
 impl RefreshFlight {
@@ -173,6 +305,8 @@ impl ConversationService {
         master_key: LocalMasterKey,
     ) -> Result<Self> {
         config.validate()?;
+        let prepared_transport = transport::prepare_service_transport(&config)?;
+        let profile = Arc::new(prepared_transport.profile);
         Ok(Self {
             message_rate_limiter: Arc::new(RateLimiter::new(
                 config.limits.messages_per_second_per_participant,
@@ -193,6 +327,9 @@ impl ConversationService {
             sse_permits: Arc::new(Semaphore::new(config.limits.max_sse_connections)),
             sse_replay_permits: Arc::new(Semaphore::new(config.limits.max_inflight_sse_replays)),
             metrics: Arc::new(ServiceMetrics::default()),
+            profile,
+            direct_tls: prepared_transport.direct_tls,
+            ready: Arc::new(AtomicBool::new(false)),
             config: Arc::new(config),
             db,
             authorization,
@@ -206,19 +343,127 @@ impl ConversationService {
         self.db.migrate().await
     }
 
+    pub fn profile(&self) -> &ConversationProfileV2 {
+        &self.profile
+    }
+
+    pub fn ensure_ready(&self) -> Result<()> {
+        if self.ready.load(Ordering::Acquire) {
+            Ok(())
+        } else {
+            Err(Error::Unavailable(
+                "conversation listeners are not ready".to_string(),
+            ))
+        }
+    }
+
     pub async fn serve(&self) -> Result<()> {
         self.migrate().await?;
         self.db.ping().await?;
         self.spawn_maintenance();
         self.spawn_event_loop_monitor();
-        let listener = tokio::net::TcpListener::bind(self.config.listen)
+        let backend_listener = tokio::net::TcpListener::bind(self.config.listen)
             .await
             .map_err(|error| Error::Internal(format!("bind {}: {error}", self.config.listen)))?;
-        tracing::info!(listen = %self.config.listen, service_id = %self.config.service.service_id, "conversation service ready");
-        axum::serve(listener, crate::api::router(self.clone()))
-            .with_graceful_shutdown(shutdown_signal())
-            .await
-            .map_err(|error| Error::Internal(format!("serve conversation API: {error}")))
+        let router = crate::api::router(self.clone());
+        let backend_router = router.clone();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let mut backend_shutdown = shutdown_rx.clone();
+        let mut servers = tokio::task::JoinSet::new();
+        servers.spawn(async move {
+            axum::serve(backend_listener, backend_router)
+                .with_graceful_shutdown(async move {
+                    let _ = backend_shutdown.wait_for(|stopping| *stopping).await;
+                })
+                .await
+                .map_err(|error| Error::Internal(format!("serve private HTTP listener: {error}")))
+        });
+
+        let tls_handle = if let Some(direct_tls) = self.direct_tls.clone() {
+            let listen = direct_tls.listen;
+            let handle = axum_server::Handle::new();
+            let server_handle = handle.clone();
+            let acceptor = BoundedTlsAcceptor::new(
+                RustlsAcceptor::new(direct_tls.rustls)
+                    .handshake_timeout(std::time::Duration::from_secs(5)),
+                self.config.limits.max_concurrent_requests.min(256),
+                self.metrics.clone(),
+            );
+            tracing::info!(listen = %listen, "zincha-tls-v1 listener ready");
+            servers.spawn(async move {
+                let mut server = axum_server::bind(listen)
+                    .acceptor(acceptor)
+                    .handle(server_handle);
+                server
+                    .http_builder()
+                    .http2()
+                    .max_concurrent_streams(128)
+                    .initial_stream_window_size(1024 * 1024)
+                    .initial_connection_window_size(8 * 1024 * 1024);
+                server
+                    .serve(router.into_make_service())
+                    .await
+                    .map_err(|error| {
+                        Error::Internal(format!("serve zincha-tls-v1 listener: {error}"))
+                    })
+            });
+            Some(handle)
+        } else {
+            None
+        };
+
+        if let Some(handle) = &tls_handle {
+            let listening =
+                tokio::time::timeout(std::time::Duration::from_secs(5), handle.listening()).await;
+            if !matches!(listening, Ok(Some(_))) {
+                self.ready.store(false, Ordering::Release);
+                let _ = shutdown_tx.send(true);
+                handle.shutdown();
+                servers.abort_all();
+                return Err(Error::Unavailable(
+                    if listening.is_err() {
+                        "zincha-tls-v1 listener startup timed out"
+                    } else {
+                        "zincha-tls-v1 listener failed to bind"
+                    }
+                    .to_string(),
+                ));
+            }
+        }
+
+        tracing::info!(listen = %self.config.listen, service_id = %self.config.service.service_id, "private conversation listener ready");
+        self.ready.store(true, Ordering::Release);
+        let mut outcome = tokio::select! {
+            _ = shutdown_signal() => Ok(()),
+            result = servers.join_next() => flatten_joined_server_result(result),
+        };
+        self.ready.store(false, Ordering::Release);
+        let _ = shutdown_tx.send(true);
+        if let Some(handle) = tls_handle {
+            handle.graceful_shutdown(Some(std::time::Duration::from_secs(30)));
+        }
+        while !servers.is_empty() {
+            match tokio::time::timeout(std::time::Duration::from_secs(30), servers.join_next())
+                .await
+            {
+                Ok(result) => {
+                    let drained = flatten_joined_server_result(result);
+                    if outcome.is_ok() && drained.is_err() {
+                        outcome = drained;
+                    }
+                }
+                Err(_) => {
+                    servers.abort_all();
+                    if outcome.is_ok() {
+                        outcome = Err(Error::Unavailable(
+                            "conversation listener graceful shutdown timed out".to_string(),
+                        ));
+                    }
+                    break;
+                }
+            }
+        }
+        outcome
     }
 
     pub async fn issue_challenge(&self, request: ChallengeRequest) -> Result<ChallengeResponse> {
@@ -741,7 +986,17 @@ impl ConversationService {
                 "# TYPE zincha_conversation_event_loop_lag_seconds gauge\n",
                 "zincha_conversation_event_loop_lag_seconds {:.6}\n",
                 "# TYPE zincha_conversation_event_loop_lag_max_seconds gauge\n",
-                "zincha_conversation_event_loop_lag_max_seconds {:.6}\n"
+                "zincha_conversation_event_loop_lag_max_seconds {:.6}\n",
+                "# TYPE zincha_conversation_transport_active_connections gauge\n",
+                "zincha_conversation_transport_active_connections{{transport=\"zincha_tls_v1\"}} {}\n",
+                "# TYPE zincha_conversation_transport_handshakes_total counter\n",
+                "zincha_conversation_transport_handshakes_total{{transport=\"zincha_tls_v1\"}} {}\n",
+                "# TYPE zincha_conversation_transport_handshake_failures_total counter\n",
+                "zincha_conversation_transport_handshake_failures_total{{transport=\"zincha_tls_v1\"}} {}\n",
+                "# TYPE zincha_conversation_transport_handshake_timeouts_total counter\n",
+                "zincha_conversation_transport_handshake_timeouts_total{{transport=\"zincha_tls_v1\"}} {}\n",
+                "# TYPE zincha_conversation_transport_handshake_seconds_total counter\n",
+                "zincha_conversation_transport_handshake_seconds_total{{transport=\"zincha_tls_v1\"}} {:.6}\n"
             ),
             metrics.messages_inserted.load(Ordering::Relaxed),
             metrics.message_retries.load(Ordering::Relaxed),
@@ -758,6 +1013,11 @@ impl ConversationService {
             inflight_sse_replays,
             metrics.event_loop_lag_micros.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             metrics.event_loop_lag_max_micros.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+            metrics.tls_active_connections.load(Ordering::Relaxed),
+            metrics.tls_handshakes.load(Ordering::Relaxed),
+            metrics.tls_handshake_failures.load(Ordering::Relaxed),
+            metrics.tls_handshake_timeouts.load(Ordering::Relaxed),
+            metrics.tls_handshake_micros.load(Ordering::Relaxed) as f64 / 1_000_000.0,
         )
     }
 
@@ -959,6 +1219,14 @@ async fn shutdown_signal() {
     {
         let _ = tokio::signal::ctrl_c().await;
     }
+}
+
+fn flatten_joined_server_result(
+    result: Option<std::result::Result<Result<()>, tokio::task::JoinError>>,
+) -> Result<()> {
+    result
+        .ok_or_else(|| Error::Internal("conversation listener set ended unexpectedly".to_string()))?
+        .map_err(|error| Error::Internal(format!("conversation listener task failed: {error}")))?
 }
 
 pub fn conversation_id(tenant: &str, service_id: &str, subject: &SubjectRef) -> Result<String> {

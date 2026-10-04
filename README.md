@@ -16,6 +16,7 @@ The service has no unsolicited inbox. A caller must prove an account-signed dele
 - SSE consumers subscribe before replay is read, preventing a replay/live gap. A bounded replay that cannot catch up returns `resync_required`. Long-lived streams revalidate chain-derived access on randomized points within the configured interval, avoiding synchronized refresh bursts, and close with `authorization_required` when the session or authorization is no longer valid.
 - Message admission, authenticated message rates, unauthenticated challenge rates, request bodies, page sizes, SSE capacity, concurrent SSE replay, broadcast buffers, database pools, and retention work are bounded.
 - Retention and ephemeral cleanup run as indexed fixed-size slices. Unresolved authentication records disappear after their short session expires; expired/revoked delegations and empty terminal conversation metadata are reclaimed after their horizons. Cleanup cannot turn an aged deployment into one unbounded delete transaction.
+- One service instance may expose the same router and database through ordinary Web-PKI HTTPS, direct `zincha-tls-v1`, or both. Direct transport is HTTP/1.1 or HTTP/2 over TLS 1.3; clients authenticate its leaf certificate against pins in the provider's on-chain profile.
 
 Artifact message parts are references to content managed by the marketplace's existing task/tool artifact store. Conversation messages do not proxy unbounded files through this service.
 `artifacts_after_terminal_secs` and `backups_secs` declare the matching external
@@ -39,6 +40,41 @@ cargo run --release -- migrate --config conversation.toml
 cargo run --release -- serve --config conversation.toml
 ```
 
+For a direct pinned endpoint, generate an Ed25519 certificate for the public IP
+and export the exact canonical profile bytes that must be published in agent
+metadata:
+
+```sh
+zincha-conversation certificate generate \
+  --host 203.0.113.25 \
+  --certificate /etc/zincha-conversation/tls/certificate.pem \
+  --private-key /run/secrets/zincha-conversation-tls-key.pem
+zincha-conversation profile export --config conversation.toml --output conversation-profile.json
+```
+
+Prepare an independent next identity for a two-pin rotation with:
+
+```sh
+zincha-conversation certificate rotate \
+  --host 203.0.113.25 \
+  --next-certificate /etc/zincha-conversation/tls/next-certificate.pem \
+  --next-private-key /run/secrets/zincha-conversation-next-tls-key.pem
+```
+
+Set `next_certificate_file`, export and finalize the overlap profile, then
+change the active certificate/key paths to the generated pair and restart the
+service. After both interfaces verify and caches have expired, remove the old
+pin from the on-chain profile. The command only creates new files and refuses
+to overwrite an existing identity.
+
+The public `zincha-tls-v1` default is TCP 443. The listener also defaults to
+`0.0.0.0:443`; an operator can instead bind an unprivileged internal port and
+map `443:<internal-port>` through a container or router. The private plaintext
+backend remains `127.0.0.1:9988` for local development and HTTPS reverse
+proxies and must never be advertised as a public interface. For IPv6, place the
+canonical literal address in `host` without brackets; clients add brackets when
+constructing the URL.
+
 The external signer contract is deliberately narrow:
 
 - `GET /v1/identity` returns `{"address":"zn1…","public_key":"<32-byte hex>"}`.
@@ -50,7 +86,7 @@ that are not regular files or that grant group/other permissions on Unix.
 
 ## Client flow
 
-1. Read the provider's `ConversationProfileV1` from its on-chain agent metadata and confirm over authenticated HTTPS that the service profile at `GET /v1/profile` matches.
+1. Read the provider's `ConversationProfileV2` from authenticated on-chain agent metadata. Select the first supported interface in provider order and require `GET /v1/profile` to match the on-chain bytes exactly before sending a credential or workflow identifier.
 2. Request a challenge with the account address and workflow reference.
 3. Sign a bounded delegation with the account key and the challenge with its delegated operational key.
 4. Create a short-lived bearer session.
@@ -62,13 +98,15 @@ See [`openapi.yaml`](openapi.yaml) for the HTTP contract. The Rust, TypeScript, 
 
 ## Security and operations
 
-- Terminate TLS at a trusted reverse proxy. Do not expose the plaintext listener outside the host network.
+- Use Web-PKI HTTPS behind a trusted reverse proxy, direct pinned `zincha-tls-v1`, or both. Do not expose the plaintext backend outside the host network.
+- Direct TLS permits one active and one next certificate pin. Rotate by publishing both pins, waiting for chain finality and profile-cache expiry, activating the new certificate, verifying both advertised interfaces, and then publishing only the new pin. A pin mismatch is a terminal security error and never triggers fallback.
+- Binding port 443 directly under systemd requires `AmbientCapabilities=CAP_NET_BIND_SERVICE` and `CapabilityBoundingSet=CAP_NET_BIND_SERVICE`. Container deployments can use `-p 443:8443` with `listen = "0.0.0.0:8443"`. Open TCP 443 for both IPv4 and IPv6 where advertised.
 - Configure an explicit `allowed_origins` list for browser SDK callers. The service never enables wildcard credentialed CORS.
 - Keep the provider signing key, payload master key, and database backups in separate security domains.
 - Backups must include the database and the exact master-key version. Test restoration before reducing backup retention.
 - Set retention values deliberately. The process refuses zero values.
 - Rotate operational delegations rather than long-lived account keys. Revocation invalidates all sessions backed by that delegation immediately.
-- Scrape `GET /metrics` for lock-free message, retry, cumulative insert-time, authorization-refresh, SSE-resync, authorization-close, maintenance-deletion, active-SSE, in-flight-message, and current/maximum event-loop-lag metrics. Monitor `429` responses and retention deletion warnings alongside these bounded counters.
+- Scrape `GET /metrics` for lock-free message, retry, cumulative insert-time, authorization-refresh, SSE-resync, authorization-close, maintenance-deletion, active-SSE, in-flight-message, TLS connection/handshake, and current/maximum event-loop-lag metrics. TLS labels contain only the bounded transport name. Monitor `429` responses and retention deletion warnings alongside these counters.
 - Size the reverse proxy for at least the configured `max_sse_connections`; ordinary-request concurrency is isolated from long-lived streams so 10,000 idle SSE clients do not consume every message/API request slot.
 
 ## Verification

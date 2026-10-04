@@ -17,9 +17,10 @@ use zincha_conversation::{
     crypto::{challenge_signing_bytes, message_signing_bytes, now_ms, payload_digest},
     model::{
         ChallengeRequest, ChallengeResponse, Conversation, ConversationKeyDelegationV1,
-        MessagePart, MessagePayload, MessageRecord, PrivacyMode, ResolveConversationRequest,
-        SessionRequest, SessionResponse, SubmitMessageRequest,
+        ConversationProfileV2, MessagePart, MessagePayload, MessageRecord, PrivacyMode,
+        ResolveConversationRequest, SessionRequest, SessionResponse, SubmitMessageRequest,
     },
+    transport::{profile_http_client, validate_profile, ClientTransportPolicy},
 };
 
 const MAX_RECORDED_SAMPLES: u64 = 5_000_000;
@@ -37,7 +38,9 @@ struct Args {
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LoadConfig {
-    base_url: String,
+    profile: ConversationProfileV2,
+    #[serde(default)]
+    transport_policy: ClientTransportPolicy,
     provider_address: String,
     delegation: ConversationKeyDelegationV1,
     operational_secret_hex: String,
@@ -84,6 +87,7 @@ struct Samples {
 #[derive(Serialize)]
 struct Report {
     protocol: &'static str,
+    transport: &'static str,
     rate_per_second: u32,
     duration_seconds: f64,
     offered: u64,
@@ -123,7 +127,16 @@ async fn main() -> Result<()> {
     .context("decode qualification config")?;
     validate_config(&config)?;
 
-    let base_url = normalized_base_url(&config.base_url)?;
+    let selected = profile_http_client(
+        &config.profile,
+        config.transport_policy,
+        Duration::from_secs(30),
+        config.max_inflight,
+    )
+    .await?;
+    let selected_transport = selected.transport;
+    let base_url = selected.base_url;
+    let http = selected.client;
     let secret: [u8; 32] = hex::decode(&config.operational_secret_hex)
         .context("operational_secret_hex is not hexadecimal")?
         .try_into()
@@ -134,12 +147,6 @@ async fn main() -> Result<()> {
     {
         bail!("operational secret does not match the delegation");
     }
-    let http = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(30))
-        .pool_max_idle_per_host(config.max_inflight)
-        .build()?;
-
     let initial = create_session(&http, &base_url, &config, operational.as_ref()).await?;
     let conversation: Conversation = post_json(
         &http,
@@ -243,6 +250,7 @@ async fn main() -> Result<()> {
     let last_sequence = samples.last_sequence;
     let report = Report {
         protocol: "zincha-conversation-v1",
+        transport: selected_transport,
         rate_per_second: config.rate_per_second,
         duration_seconds: elapsed,
         offered: samples.offered,
@@ -271,6 +279,7 @@ async fn main() -> Result<()> {
 }
 
 fn validate_config(config: &LoadConfig) -> Result<()> {
+    validate_profile(&config.profile)?;
     if config.rate_per_second == 0
         || config.rate_per_second > 100_000
         || config.duration_seconds == 0
@@ -291,26 +300,6 @@ fn validate_config(config: &LoadConfig) -> Result<()> {
         bail!("delegation must remain valid for the complete qualification run");
     }
     Ok(())
-}
-
-fn normalized_base_url(value: &str) -> Result<String> {
-    let parsed = url::Url::parse(value).context("parse base_url")?;
-    let loopback = parsed.host_str().is_some_and(|host| {
-        host.eq_ignore_ascii_case("localhost")
-            || host
-                .parse::<std::net::IpAddr>()
-                .is_ok_and(|address| address.is_loopback())
-    });
-    if parsed.host_str().is_none()
-        || !parsed.username().is_empty()
-        || parsed.password().is_some()
-        || parsed.query().is_some()
-        || parsed.fragment().is_some()
-        || (parsed.scheme() != "https" && !(parsed.scheme() == "http" && loopback))
-    {
-        bail!("base_url must use HTTPS, except for loopback development");
-    }
-    Ok(value.trim_end_matches('/').to_string())
 }
 
 async fn create_session(

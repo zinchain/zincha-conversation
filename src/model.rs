@@ -3,6 +3,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROFILE_VERSION: u16 = 2;
 pub const DEFAULT_CHANNEL: &str = "default";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,15 +84,35 @@ impl SubjectSnapshot {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ConversationProfileV1 {
+pub struct TlsCertificatePin {
+    pub sha256: String,
+    pub not_before_ms: i64,
+    pub not_after_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ConversationInterface {
+    Https {
+        url: String,
+    },
+    ZinchaTlsV1 {
+        host: String,
+        port: u16,
+        certificate_pins: Vec<TlsCertificatePin>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConversationProfileV2 {
     pub version: u16,
     pub service_id: String,
-    pub discovery_url: String,
+    pub interfaces: Vec<ConversationInterface>,
     pub privacy_modes: Vec<PrivacyMode>,
     pub protocol_versions: Vec<u16>,
-    pub service_signing_public_key: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -11,6 +11,10 @@ use clap::Parser;
 use futures_util::StreamExt as _;
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
+use zincha_conversation::{
+    model::ConversationProfileV2,
+    transport::{profile_http_client, validate_profile, ClientTransportPolicy},
+};
 
 const MAX_CONNECTIONS: usize = 100_000;
 const MAX_EVENT_BUFFER_BYTES: usize = 1024 * 1024;
@@ -26,7 +30,9 @@ struct Args {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SseConfig {
-    base_url: String,
+    profile: ConversationProfileV2,
+    #[serde(default)]
+    transport_policy: ClientTransportPolicy,
     conversation_id: String,
     access_token: String,
     #[serde(default = "default_connections")]
@@ -69,6 +75,7 @@ struct StreamResult {
 #[derive(Serialize)]
 struct Report {
     protocol: &'static str,
+    transport: &'static str,
     requested_connections: usize,
     connected: usize,
     connection_failures: usize,
@@ -96,12 +103,16 @@ async fn main() -> Result<()> {
     .context("decode SSE qualification config")?;
     validate_config(&config)?;
 
-    let base_url = normalized_base_url(&config.base_url)?;
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(config.hold_seconds.saturating_add(60)))
-        .pool_max_idle_per_host(0)
-        .build()?;
+    let selected = profile_http_client(
+        &config.profile,
+        config.transport_policy,
+        Duration::from_secs(config.hold_seconds.saturating_add(60)),
+        0,
+    )
+    .await?;
+    let selected_transport = selected.transport;
+    let base_url = selected.base_url;
+    let client = selected.client;
     let ramp_started = tokio::time::Instant::now();
     let period = Duration::from_secs_f64(1.0 / f64::from(config.ramp_per_second));
     let mut next = ramp_started;
@@ -200,6 +211,7 @@ async fn main() -> Result<()> {
 
     let report = Report {
         protocol: "zincha-conversation-v1",
+        transport: selected_transport,
         requested_connections: config.connections,
         connected: connect_latencies.len(),
         connection_failures,
@@ -284,6 +296,7 @@ fn consume_events(buffer: &mut Vec<u8>, result: &mut StreamResult) {
 }
 
 fn validate_config(config: &SseConfig) -> Result<()> {
+    validate_profile(&config.profile)?;
     if config.connections == 0
         || config.connections > MAX_CONNECTIONS
         || config.ramp_per_second == 0
@@ -305,26 +318,6 @@ fn is_hex_id(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
-fn normalized_base_url(value: &str) -> Result<String> {
-    let parsed = url::Url::parse(value).context("parse base_url")?;
-    let loopback = parsed.host_str().is_some_and(|host| {
-        host.eq_ignore_ascii_case("localhost")
-            || host
-                .parse::<std::net::IpAddr>()
-                .is_ok_and(|address| address.is_loopback())
-    });
-    if parsed.host_str().is_none()
-        || !parsed.username().is_empty()
-        || parsed.password().is_some()
-        || parsed.query().is_some()
-        || parsed.fragment().is_some()
-        || (parsed.scheme() != "https" && !(parsed.scheme() == "http" && loopback))
-    {
-        bail!("base_url must use HTTPS, except for loopback development");
-    }
-    Ok(value.trim_end_matches('/').to_string())
 }
 
 fn percentile(values: &[u64], percentile: usize) -> Option<f64> {

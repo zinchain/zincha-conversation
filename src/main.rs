@@ -1,8 +1,8 @@
-use std::path::PathBuf;
+use std::{io::Write, path::PathBuf};
 
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
-use zincha_conversation::{storage::Database, Config, ConversationService};
+use zincha_conversation::{storage::Database, transport, Config, ConversationService};
 
 #[derive(Parser)]
 #[command(name = "zincha-conversation", version, about)]
@@ -24,6 +24,49 @@ enum Command {
     Check {
         #[arg(long)]
         config: PathBuf,
+    },
+    Profile {
+        #[command(subcommand)]
+        command: ProfileCommand,
+    },
+    Certificate {
+        #[command(subcommand)]
+        command: CertificateCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProfileCommand {
+    Export {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum CertificateCommand {
+    Generate {
+        #[arg(long)]
+        host: String,
+        #[arg(long)]
+        certificate: PathBuf,
+        #[arg(long)]
+        private_key: PathBuf,
+        #[arg(long, default_value_t = 365)]
+        valid_days: u32,
+    },
+    /// Generate the next independent identity used during a two-pin rotation.
+    Rotate {
+        #[arg(long)]
+        host: String,
+        #[arg(long)]
+        next_certificate: PathBuf,
+        #[arg(long)]
+        next_private_key: PathBuf,
+        #[arg(long, default_value_t = 365)]
+        valid_days: u32,
     },
 }
 
@@ -50,11 +93,49 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Check { config } => {
             let config = Config::load(&config)?;
+            let profile = transport::build_profile(&config)?;
             println!(
-                "configuration valid for service {}",
-                config.service.service_id
+                "configuration valid for service {} with {} interface(s)",
+                config.service.service_id,
+                profile.interfaces.len(),
             );
         }
+        Command::Profile { command } => match command {
+            ProfileCommand::Export { config, output } => {
+                let bytes = transport::canonical_profile_json(&Config::load(&config)?)?;
+                if let Some(path) = output {
+                    std::fs::write(path, bytes)?;
+                } else {
+                    std::io::stdout().lock().write_all(&bytes)?;
+                }
+            }
+        },
+        Command::Certificate { command } => match command {
+            CertificateCommand::Generate {
+                host,
+                certificate,
+                private_key,
+                valid_days,
+            } => {
+                let pin =
+                    transport::generate_identity(&host, &certificate, &private_key, valid_days)?;
+                println!("{}", serde_json::to_string(&pin)?);
+            }
+            CertificateCommand::Rotate {
+                host,
+                next_certificate,
+                next_private_key,
+                valid_days,
+            } => {
+                let pin = transport::generate_identity(
+                    &host,
+                    &next_certificate,
+                    &next_private_key,
+                    valid_days,
+                )?;
+                println!("{}", serde_json::to_string(&pin)?);
+            }
+        },
     }
     Ok(())
 }

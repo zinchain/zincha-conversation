@@ -50,6 +50,17 @@ fn openapi_is_valid_and_covers_the_public_router() {
         Some("#/components/schemas/SubjectSnapshot")
     );
     assert!(document["components"]["schemas"]["MessagePart"]["oneOf"].is_sequence());
+    assert_eq!(
+        document["components"]["schemas"]["ConversationProfile"]["properties"]["version"]["const"]
+            .as_u64(),
+        Some(2)
+    );
+    assert_eq!(
+        document["components"]["schemas"]["ZinchaTlsV1ConversationInterface"]["properties"]["port"]
+            ["default"]
+            .as_u64(),
+        Some(443)
+    );
     for strict_schema in [
         "ChallengeRequest",
         "SessionRequest",
@@ -57,6 +68,9 @@ fn openapi_is_valid_and_covers_the_public_router() {
         "SubmitMessageRequest",
         "Message",
         "ConversationProfile",
+        "HttpsConversationInterface",
+        "ZinchaTlsV1ConversationInterface",
+        "TlsCertificatePin",
     ] {
         assert_eq!(
             document["components"]["schemas"][strict_schema]["additionalProperties"].as_bool(),

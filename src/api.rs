@@ -19,8 +19,8 @@ use crate::{
     crypto::{now_ms, random_bytes},
     error::{Error, Result},
     model::{
-        AcknowledgeRequest, ChallengeRequest, ConversationProfileV1, ResolveConversationRequest,
-        SessionRequest, SubmitMessageRequest, PROTOCOL_VERSION,
+        AcknowledgeRequest, ChallengeRequest, ResolveConversationRequest, SessionRequest,
+        SubmitMessageRequest,
     },
     service::ConversationService,
 };
@@ -107,6 +107,7 @@ async fn health() -> impl IntoResponse {
 }
 
 async fn ready(State(service): State<ConversationService>) -> Result<impl IntoResponse> {
+    service.ensure_ready()?;
     service.db.ping().await?;
     Ok(ok(serde_json::json!({"status": "ready"})))
 }
@@ -122,14 +123,7 @@ async fn metrics(State(service): State<ConversationService>) -> impl IntoRespons
 }
 
 async fn profile(State(service): State<ConversationService>) -> impl IntoResponse {
-    ok(ConversationProfileV1 {
-        version: PROTOCOL_VERSION,
-        service_id: service.config.service.service_id.clone(),
-        discovery_url: service.config.service.public_url.clone(),
-        privacy_modes: service.config.service.privacy_modes.clone(),
-        protocol_versions: vec![PROTOCOL_VERSION],
-        service_signing_public_key: service.config.service.service_signing_public_key.clone(),
-    })
+    ok(service.profile().clone())
 }
 
 async fn issue_challenge(
