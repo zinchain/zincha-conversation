@@ -388,8 +388,8 @@ impl RefreshFlight {
 
 #[derive(Debug, Clone, Copy)]
 struct RateWindow {
-    bucket: i64,
-    count: u32,
+    available_units: u64,
+    last_refill_ms: i64,
 }
 
 struct RateLimiter {
@@ -419,35 +419,41 @@ impl RateLimiter {
     }
 
     async fn check(&self, key: &str, timestamp_ms: i64) -> Result<()> {
-        let bucket = timestamp_ms / self.window_ms;
         let shard_index = (self.hash_builder.hash_one(key) as usize) % self.shards.len();
         let mut windows = self.shards[shard_index].lock().await;
         if windows.len() >= self.max_entries_per_shard && !windows.contains_key(key) {
-            windows.retain(|_, window| window.bucket >= bucket - 1);
+            let stale_before = timestamp_ms.saturating_sub(self.window_ms);
+            windows.retain(|_, window| window.last_refill_ms >= stale_before);
             if windows.len() >= self.max_entries_per_shard {
                 return Err(Error::RateLimited(self.rejection_message.to_string()));
             }
         }
-        let window = windows
-            .entry(key.to_string())
-            .or_insert(RateWindow { bucket, count: 0 });
-        if window.bucket != bucket {
-            *window = RateWindow { bucket, count: 0 };
-        }
-        if window.count >= self.limit {
+        let window_units = u64::try_from(self.window_ms).unwrap_or(1);
+        let capacity = u64::from(self.limit).saturating_mul(window_units);
+        let window = windows.entry(key.to_string()).or_insert(RateWindow {
+            available_units: capacity,
+            last_refill_ms: timestamp_ms,
+        });
+        let elapsed_ms = timestamp_ms.saturating_sub(window.last_refill_ms).max(0) as u64;
+        window.available_units = window
+            .available_units
+            .saturating_add(elapsed_ms.saturating_mul(u64::from(self.limit)))
+            .min(capacity);
+        window.last_refill_ms = window.last_refill_ms.max(timestamp_ms);
+        if window.available_units < window_units {
             return Err(Error::RateLimited(self.rejection_message.to_string()));
         }
-        window.count += 1;
+        window.available_units -= window_units;
         Ok(())
     }
 
     async fn cleanup(&self, timestamp_ms: i64) {
-        let bucket = timestamp_ms / self.window_ms;
+        let stale_before = timestamp_ms.saturating_sub(self.window_ms);
         for shard in &self.shards {
             shard
                 .lock()
                 .await
-                .retain(|_, window| window.bucket >= bucket - 1);
+                .retain(|_, window| window.last_refill_ms >= stale_before);
         }
     }
 
@@ -1721,6 +1727,22 @@ mod tests {
         assert!(limiter.check("a", 2_000).await.is_ok());
         limiter.cleanup(4_000).await;
         assert_eq!(limiter.entry_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn rate_limiter_retains_unused_capacity_across_fixed_window_boundaries() {
+        let limiter = RateLimiter::new(12, 1_000, "limited");
+        for offset in 0..40 {
+            assert!(limiter.check("paced", 900 + offset * 100).await.is_ok());
+        }
+        for _ in 0..12 {
+            assert!(limiter.check("burst", 5_000).await.is_ok());
+        }
+        assert!(matches!(
+            limiter.check("burst", 5_000).await,
+            Err(Error::RateLimited(_))
+        ));
+        assert!(limiter.check("burst", 5_084).await.is_ok());
     }
 
     #[test]
