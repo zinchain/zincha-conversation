@@ -180,7 +180,7 @@ async fn run_message_ingest(
             match outcomes {
                 Ok(outcomes) => {
                     for (response, outcome) in responses.into_iter().zip(outcomes) {
-                        let _ = response.send(Ok(outcome));
+                        let _ = response.send(outcome);
                     }
                 }
                 Err(error) => {

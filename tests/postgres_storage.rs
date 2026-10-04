@@ -172,7 +172,7 @@ async fn postgres_atomic_session_and_concurrent_message_retry() {
         .await
         .unwrap()
         .into_iter()
-        .map(|outcome| match outcome {
+        .map(|outcome| match outcome.unwrap() {
             InsertMessageOutcome::Inserted(row) => row.sequence,
             InsertMessageOutcome::Existing(_) => {
                 panic!("a distinct message was treated as a retry")
@@ -187,7 +187,7 @@ async fn postgres_atomic_session_and_concurrent_message_retry() {
         .into_iter()
         .enumerate()
     {
-        match outcome {
+        match outcome.unwrap() {
             InsertMessageOutcome::Existing(row) => {
                 assert_eq!(row.sequence, position as i64 + 2)
             }
@@ -224,7 +224,7 @@ async fn postgres_atomic_session_and_concurrent_message_retry() {
     }
     for batch in concurrent_batches {
         for outcome in batch.await.unwrap() {
-            match outcome {
+            match outcome.unwrap() {
                 InsertMessageOutcome::Inserted(row) => sequences.push(row.sequence),
                 InsertMessageOutcome::Existing(_) => {
                     panic!("a distinct concurrent batch message was treated as a retry")
@@ -234,6 +234,37 @@ async fn postgres_atomic_session_and_concurrent_message_retry() {
     }
     sequences.sort_unstable();
     assert_eq!(sequences, (2..=97).collect::<Vec<_>>());
+
+    let mut conflicting_retry = distinct_messages[0].clone();
+    conflicting_retry.payload_digest = "aa".repeat(32);
+    let final_message = NewMessage {
+        conversation_id: conversation_id.clone(),
+        message_id: Uuid::now_v7(),
+        sender: participant,
+        client_timestamp_ms: timestamp,
+        accepted_at_ms: timestamp,
+        reply_to: None,
+        key_epoch: Some(1),
+        payload_blob: b"final".to_vec(),
+        payload_digest: hex::encode(Sha256::digest(b"final")),
+        signing_key_id: delegation.delegation_id.to_string(),
+        signature: "99".repeat(64),
+    };
+    let mut mixed = database
+        .insert_messages(&[conflicting_retry, final_message])
+        .await
+        .unwrap()
+        .into_iter();
+    assert!(mixed
+        .next()
+        .unwrap()
+        .unwrap_err()
+        .to_string()
+        .starts_with("conflict:"));
+    match mixed.next().unwrap().unwrap() {
+        InsertMessageOutcome::Inserted(row) => assert_eq!(row.sequence, 98),
+        InsertMessageOutcome::Existing(_) => panic!("the final distinct message was a retry"),
+    }
 
     if let Database::Postgres(pool) = database {
         let (message_count, event_count, next_sequence): (i64, i64, i64) = sqlx::query_as(
@@ -246,7 +277,7 @@ async fn postgres_atomic_session_and_concurrent_message_retry() {
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!((message_count, event_count, next_sequence), (97, 97, 98));
+        assert_eq!((message_count, event_count, next_sequence), (98, 98, 99));
         let mismatched_events: i64 = sqlx::query_scalar(
             "SELECT COUNT(*)
                FROM conversation_events AS event

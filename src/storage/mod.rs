@@ -545,7 +545,7 @@ impl Database {
     pub async fn insert_messages(
         &self,
         messages: &[NewMessage],
-    ) -> Result<Vec<InsertMessageOutcome>> {
+    ) -> Result<Vec<Result<InsertMessageOutcome>>> {
         if messages.is_empty() {
             return Ok(Vec::new());
         }
@@ -554,7 +554,7 @@ impl Database {
             Self::Sqlite(_) => {
                 let mut outcomes = Vec::with_capacity(messages.len());
                 for message in messages {
-                    outcomes.push(self.insert_message(message).await?);
+                    outcomes.push(self.insert_message(message).await);
                 }
                 Ok(outcomes)
             }
@@ -992,7 +992,7 @@ async fn insert_message_postgres(
 async fn insert_messages_postgres(
     pool: &PgPool,
     messages: &[NewMessage],
-) -> Result<Vec<InsertMessageOutcome>> {
+) -> Result<Vec<Result<InsertMessageOutcome>>> {
     let conversation_id = &messages[0].conversation_id;
     if messages
         .iter()
@@ -1069,26 +1069,25 @@ async fn insert_messages_postgres(
         ));
     }
 
-    rows.into_iter()
-        .zip(messages)
-        .enumerate()
-        .map(|(position, (row, message))| {
-            let input_index: i32 = row.try_get("input_index")?;
-            if input_index != (position + 1) as i32 {
-                return Err(Error::Internal(
-                    "PostgreSQL returned a reordered message batch".to_string(),
-                ));
-            }
-            let inserted: bool = row.try_get("was_inserted")?;
-            let stored = message_from_postgres(conversation_id, &row)?;
-            validate_idempotent(&stored, message)?;
-            Ok(if inserted {
+    let mut outcomes = Vec::with_capacity(messages.len());
+    for (position, (row, message)) in rows.into_iter().zip(messages).enumerate() {
+        let input_index: i32 = row.try_get("input_index")?;
+        if input_index != (position + 1) as i32 {
+            return Err(Error::Internal(
+                "PostgreSQL returned a reordered message batch".to_string(),
+            ));
+        }
+        let inserted: bool = row.try_get("was_inserted")?;
+        let stored = message_from_postgres(conversation_id, &row)?;
+        outcomes.push(validate_idempotent(&stored, message).map(|()| {
+            if inserted {
                 InsertMessageOutcome::Inserted(stored)
             } else {
                 InsertMessageOutcome::Existing(stored)
-            })
-        })
-        .collect()
+            }
+        }));
+    }
+    Ok(outcomes)
 }
 
 fn validate_idempotent(existing: &StoredMessage, message: &NewMessage) -> Result<()> {
