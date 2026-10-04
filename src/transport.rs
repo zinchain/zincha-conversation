@@ -803,6 +803,16 @@ mod tests {
         assert!(validate_profile(&profile).is_err());
 
         profile.protocol_versions = vec![PROTOCOL_VERSION];
+        let ConversationInterface::ZinchaTlsV1 {
+            certificate_pins, ..
+        } = &mut profile.interfaces[0]
+        else {
+            unreachable!()
+        };
+        certificate_pins.truncate(1);
+        certificate_pins.push(certificate_pins[0].clone());
+        assert!(validate_profile(&profile).is_err());
+
         profile.interfaces = vec![ConversationInterface::Https {
             url: format!("https://example.test/{}", "x".repeat(2_049)),
         }];
