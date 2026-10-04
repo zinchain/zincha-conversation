@@ -28,13 +28,23 @@ use zincha_conversation::{
     },
     error::Result,
     model::{
-        ChallengeRequest, ConversationKeyDelegationV1, MessagePart, MessagePayload, Participant,
-        ParticipantRole, PrivacyMode, ResolveConversationRequest, SessionRequest, SubjectKind,
+        ChallengeRequest, ChallengeResponse, Conversation, ConversationKeyDelegationV1,
+        MessagePart, MessagePayload, MessageRecord, Page, Participant, ParticipantRole,
+        PrivacyMode, ResolveConversationRequest, SessionRequest, SessionResponse, SubjectKind,
         SubjectRef, SubjectSnapshot, SubmitMessageRequest,
     },
     storage::Database,
+    transport::{
+        generate_identity, prepare_service_transport, profile_http_client, ClientTransportPolicy,
+    },
     Config, ConversationService,
 };
+
+#[derive(serde::Deserialize)]
+struct ApiResponse<T> {
+    success: bool,
+    data: T,
+}
 
 #[derive(Clone)]
 struct StaticAuthorization {
@@ -231,6 +241,13 @@ async fn signed_session_request(fixture: &Fixture) -> SessionRequest {
         })
         .await
         .unwrap();
+    signed_session_request_for_challenge(fixture, challenge)
+}
+
+fn signed_session_request_for_challenge(
+    fixture: &Fixture,
+    challenge: ChallengeResponse,
+) -> SessionRequest {
     let current = now_ms();
     let delegation_id = Uuid::now_v7();
     let mut delegation = ConversationKeyDelegationV1 {
@@ -303,6 +320,197 @@ fn signed_message(
             .to_bytes(),
     );
     request
+}
+
+#[tokio::test]
+async fn bearer_session_and_ordered_messages_move_between_private_http_and_pinned_tls() {
+    let fixture = fixture().await;
+    let certificate = fixture._temp.path().join("direct-certificate.pem");
+    let private_key = fixture._temp.path().join("direct-key.pem");
+    generate_identity("127.0.0.1", &certificate, &private_key, 30).unwrap();
+
+    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_address = backend_listener.local_addr().unwrap();
+    let tls_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    tls_listener.set_nonblocking(true).unwrap();
+    let tls_address = tls_listener.local_addr().unwrap();
+
+    let mut config = (*fixture.service.config).clone();
+    config.listen = backend_address;
+    config.service.interfaces = vec![ServiceInterfaceConfig::ZinchaTlsV1 {
+        host: "127.0.0.1".to_string(),
+        port: tls_address.port(),
+        listen: tls_address,
+        certificate_file: certificate,
+        private_key_file: private_key,
+        next_certificate_file: None,
+    }];
+    let prepared = prepare_service_transport(&config).unwrap();
+    let direct_tls = prepared.direct_tls.unwrap();
+    let snapshot = SubjectSnapshot {
+        subject: fixture.subject.clone(),
+        status: "matched".to_string(),
+        provider: fixture.provider.clone(),
+        participants: vec![
+            Participant {
+                address: fixture.participant.clone(),
+                roles: vec![ParticipantRole::Requester],
+                can_read: true,
+                can_write: true,
+            },
+            Participant {
+                address: fixture.provider.clone(),
+                roles: vec![ParticipantRole::Provider],
+                can_read: true,
+                can_write: true,
+            },
+        ],
+        terminal_at_ms: None,
+        write_until_ms: None,
+        lifecycle_seq: Some(2),
+        observed_height: 42,
+        observed_block_hash: "cd".repeat(32),
+        observed_at_ms: now_ms(),
+        digest: "ef".repeat(32),
+    };
+    let service = ConversationService::new(
+        config,
+        fixture.service.db.clone(),
+        Arc::new(StaticAuthorization {
+            snapshot,
+            calls: Arc::new(AtomicUsize::new(0)),
+            block_next: Arc::new(AtomicBool::new(false)),
+            blocked_call_started: Arc::new(tokio::sync::Semaphore::new(0)),
+            blocked_call_release: Arc::new(tokio::sync::Semaphore::new(0)),
+        }),
+        LocalMasterKey::from_hex(&"44".repeat(32)).unwrap(),
+    )
+    .await
+    .unwrap();
+    service.migrate().await.unwrap();
+    let app = zincha_conversation::api::router(service.clone());
+    let backend_app = app.clone();
+    let backend_task =
+        tokio::spawn(async move { axum::serve(backend_listener, backend_app).await });
+    let tls_handle = axum_server::Handle::new();
+    let tls_server = axum_server::from_tcp(tls_listener)
+        .unwrap()
+        .acceptor(axum_server::tls_rustls::RustlsAcceptor::new(
+            direct_tls.rustls,
+        ))
+        .handle(tls_handle.clone());
+    let tls_task = tokio::spawn(tls_server.serve(app.into_make_service()));
+    tls_handle.listening().await.unwrap();
+
+    let backend = reqwest::Client::new();
+    let backend_url = format!("http://{backend_address}");
+    let challenge = backend
+        .post(format!("{backend_url}/v1/auth/challenges"))
+        .json(&ChallengeRequest {
+            participant_address: fixture.participant.clone(),
+            subject: fixture.subject.clone(),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json::<ApiResponse<ChallengeResponse>>()
+        .await
+        .unwrap();
+    assert!(challenge.success);
+    let session_request = signed_session_request_for_challenge(&fixture, challenge.data);
+    let delegation_id = session_request.delegation.delegation_id;
+    let session = backend
+        .post(format!("{backend_url}/v1/auth/sessions"))
+        .json(&session_request)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json::<ApiResponse<SessionResponse>>()
+        .await
+        .unwrap();
+    assert!(session.success);
+
+    let pinned = profile_http_client(
+        service.profile(),
+        ClientTransportPolicy::ZinchaTlsOnly,
+        std::time::Duration::from_secs(5),
+        2,
+    )
+    .await
+    .unwrap();
+    let resolution = ResolveConversationRequest {
+        subject: fixture.subject.clone(),
+        provider_address: fixture.provider.clone(),
+        privacy_mode: PrivacyMode::PlatformReadable,
+    };
+    let conversation = pinned
+        .client
+        .post(format!("{}/v1/conversations/resolve", pinned.base_url))
+        .bearer_auth(&session.data.access_token)
+        .json(&resolution)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json::<ApiResponse<Conversation>>()
+        .await
+        .unwrap();
+    assert!(conversation.success);
+
+    let message = signed_message(
+        &fixture,
+        &conversation.data.id,
+        delegation_id,
+        Uuid::now_v7(),
+        "cross-interface",
+    );
+    let accepted = backend
+        .post(format!(
+            "{backend_url}/v1/conversations/{}/messages",
+            conversation.data.id
+        ))
+        .bearer_auth(&session.data.access_token)
+        .json(&message)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json::<ApiResponse<MessageRecord>>()
+        .await
+        .unwrap();
+    assert!(accepted.success);
+    assert_eq!(accepted.data.sequence, 1);
+
+    let listed = pinned
+        .client
+        .get(format!(
+            "{}/v1/conversations/{}/messages?after=0&limit=100",
+            pinned.base_url, conversation.data.id
+        ))
+        .bearer_auth(&session.data.access_token)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json::<ApiResponse<Page<MessageRecord>>>()
+        .await
+        .unwrap();
+    assert!(listed.success);
+    assert_eq!(listed.data.items.len(), 1);
+    assert_eq!(listed.data.items[0].message_id, message.message_id);
+    assert_eq!(listed.data.items[0].sequence, 1);
+
+    tls_handle.shutdown();
+    tls_task.await.unwrap().unwrap();
+    backend_task.abort();
+    let _ = backend_task.await;
 }
 
 #[tokio::test]
