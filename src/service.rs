@@ -70,6 +70,7 @@ struct ServiceMetrics {
     tls_handshake_failures: AtomicU64,
     tls_handshake_timeouts: AtomicU64,
     tls_handshake_micros: AtomicU64,
+    tls_connection_rejections: AtomicU64,
 }
 
 #[derive(Default)]
@@ -81,15 +82,22 @@ struct RefreshFlight {
 #[derive(Clone)]
 struct BoundedTlsAcceptor {
     inner: RustlsAcceptor,
-    permits: Arc<Semaphore>,
+    handshake_permits: Arc<Semaphore>,
+    connection_permits: Arc<Semaphore>,
     metrics: Arc<ServiceMetrics>,
 }
 
 impl BoundedTlsAcceptor {
-    fn new(inner: RustlsAcceptor, limit: usize, metrics: Arc<ServiceMetrics>) -> Self {
+    fn new(
+        inner: RustlsAcceptor,
+        handshake_limit: usize,
+        connection_limit: usize,
+        metrics: Arc<ServiceMetrics>,
+    ) -> Self {
         Self {
             inner,
-            permits: Arc::new(Semaphore::new(limit)),
+            handshake_permits: Arc::new(Semaphore::new(handshake_limit)),
+            connection_permits: Arc::new(Semaphore::new(connection_limit)),
             metrics,
         }
     }
@@ -98,6 +106,7 @@ impl BoundedTlsAcceptor {
 struct TrackedTlsStream<T> {
     inner: T,
     metrics: Arc<ServiceMetrics>,
+    _connection_permit: OwnedSemaphorePermit,
 }
 
 impl<T> Drop for TrackedTlsStream<T> {
@@ -147,11 +156,12 @@ where
     type Future = Pin<Box<dyn Future<Output = io::Result<(Self::Stream, S)>> + Send>>;
 
     fn accept(&self, stream: I, service: S) -> Self::Future {
-        let permits = self.permits.clone();
+        let handshake_permits = self.handshake_permits.clone();
+        let connection_permits = self.connection_permits.clone();
         let inner = self.inner.clone();
         let metrics = self.metrics.clone();
         Box::pin(async move {
-            let _permit = permits.try_acquire_owned().map_err(|_| {
+            let _handshake_permit = handshake_permits.try_acquire_owned().map_err(|_| {
                 metrics
                     .tls_handshake_failures
                     .fetch_add(1, Ordering::Relaxed);
@@ -164,6 +174,16 @@ where
             metrics.tls_handshakes.fetch_add(1, Ordering::Relaxed);
             match inner.accept(stream, service).await {
                 Ok((stream, service)) => {
+                    let connection_permit =
+                        connection_permits.try_acquire_owned().map_err(|_| {
+                            metrics
+                                .tls_connection_rejections
+                                .fetch_add(1, Ordering::Relaxed);
+                            io::Error::new(
+                                io::ErrorKind::WouldBlock,
+                                "TLS connection capacity exhausted",
+                            )
+                        })?;
                     metrics.tls_handshake_micros.fetch_add(
                         started.elapsed().as_micros().min(u64::MAX as u128) as u64,
                         Ordering::Relaxed,
@@ -175,6 +195,7 @@ where
                         TrackedTlsStream {
                             inner: stream,
                             metrics,
+                            _connection_permit: connection_permit,
                         },
                         service,
                     ))
@@ -387,6 +408,10 @@ impl ConversationService {
                 RustlsAcceptor::new(direct_tls.rustls)
                     .handshake_timeout(std::time::Duration::from_secs(5)),
                 self.config.limits.max_concurrent_requests.min(256),
+                self.config
+                    .limits
+                    .max_sse_connections
+                    .saturating_add(self.config.limits.max_concurrent_requests),
                 self.metrics.clone(),
             );
             tracing::info!(listen = %listen, "zincha-tls-v1 listener ready");
@@ -996,7 +1021,9 @@ impl ConversationService {
                 "# TYPE zincha_conversation_transport_handshake_timeouts_total counter\n",
                 "zincha_conversation_transport_handshake_timeouts_total{{transport=\"zincha_tls_v1\"}} {}\n",
                 "# TYPE zincha_conversation_transport_handshake_seconds_total counter\n",
-                "zincha_conversation_transport_handshake_seconds_total{{transport=\"zincha_tls_v1\"}} {:.6}\n"
+                "zincha_conversation_transport_handshake_seconds_total{{transport=\"zincha_tls_v1\"}} {:.6}\n",
+                "# TYPE zincha_conversation_transport_connection_rejections_total counter\n",
+                "zincha_conversation_transport_connection_rejections_total{{transport=\"zincha_tls_v1\"}} {}\n"
             ),
             metrics.messages_inserted.load(Ordering::Relaxed),
             metrics.message_retries.load(Ordering::Relaxed),
@@ -1018,6 +1045,7 @@ impl ConversationService {
             metrics.tls_handshake_failures.load(Ordering::Relaxed),
             metrics.tls_handshake_timeouts.load(Ordering::Relaxed),
             metrics.tls_handshake_micros.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+            metrics.tls_connection_rejections.load(Ordering::Relaxed),
         )
     }
 
@@ -1348,6 +1376,102 @@ fn payload_aad(conversation_id: &str, message_id: Uuid, digest: &str) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn direct_tls_enforces_protocol_and_connection_bounds() {
+        let directory = tempfile::tempdir().unwrap();
+        let certificate = directory.path().join("certificate.pem");
+        let private_key = directory.path().join("key.pem");
+        crate::transport::generate_identity("127.0.0.1", &certificate, &private_key, 30).unwrap();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut config: Config = toml::from_str(include_str!("../config.example.toml")).unwrap();
+        config.service.interfaces = vec![crate::config::ServiceInterfaceConfig::ZinchaTlsV1 {
+            host: "127.0.0.1".to_string(),
+            port: address.port(),
+            listen: address,
+            certificate_file: certificate,
+            private_key_file: private_key,
+            next_certificate_file: None,
+        }];
+        let prepared = crate::transport::prepare_service_transport(&config).unwrap();
+        let profile = prepared.profile;
+        let direct = prepared.direct_tls.unwrap();
+        let response_profile = profile.clone();
+        let app = axum::Router::new().route(
+            "/v1/profile",
+            axum::routing::get(move || {
+                let profile = response_profile.clone();
+                async move {
+                    axum::Json(serde_json::json!({
+                        "success": true,
+                        "data": profile,
+                    }))
+                }
+            }),
+        );
+        let metrics = Arc::new(ServiceMetrics::default());
+        let acceptor = BoundedTlsAcceptor::new(
+            RustlsAcceptor::new(direct.rustls).handshake_timeout(std::time::Duration::from_secs(2)),
+            1,
+            1,
+            metrics.clone(),
+        );
+        let handle = axum_server::Handle::new();
+        let server = axum_server::from_tcp(listener)
+            .unwrap()
+            .acceptor(acceptor)
+            .handle(handle.clone());
+        let server_task = tokio::spawn(server.serve(app.into_make_service()));
+        handle.listening().await.unwrap();
+
+        let tls12 = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .min_tls_version(reqwest::tls::Version::TLS_1_2)
+            .max_tls_version(reqwest::tls::Version::TLS_1_2)
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap();
+        assert!(tls12
+            .get(format!("https://{address}/v1/profile"))
+            .send()
+            .await
+            .is_err());
+        assert!(reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap()
+            .get(format!("http://{address}/v1/profile"))
+            .send()
+            .await
+            .is_err());
+
+        let first = crate::transport::profile_http_client(
+            &profile,
+            crate::transport::ClientTransportPolicy::ZinchaTlsOnly,
+            std::time::Duration::from_secs(2),
+            1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(metrics.tls_active_connections.load(Ordering::Relaxed), 1);
+
+        let second = crate::transport::profile_http_client(
+            &profile,
+            crate::transport::ClientTransportPolicy::ZinchaTlsOnly,
+            std::time::Duration::from_secs(2),
+            1,
+        )
+        .await;
+        assert!(second.is_err());
+        assert!(metrics.tls_connection_rejections.load(Ordering::Relaxed) > 0);
+
+        drop(first);
+        handle.shutdown();
+        server_task.await.unwrap().unwrap();
+    }
 
     #[tokio::test]
     async fn rate_limiter_is_bounded_by_key_and_window() {

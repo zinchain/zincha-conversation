@@ -1078,6 +1078,9 @@ async fn metrics_endpoint_exposes_bounded_operational_counters() {
     assert!(text.contains("zincha_conversation_inflight_sse_replays"));
     assert!(text.contains("zincha_conversation_event_loop_lag_seconds"));
     assert!(text.contains("zincha_conversation_event_loop_lag_max_seconds"));
+    assert!(text.contains(
+        "zincha_conversation_transport_connection_rejections_total{transport=\"zincha_tls_v1\"}"
+    ));
 }
 
 #[tokio::test]

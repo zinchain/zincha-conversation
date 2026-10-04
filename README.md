@@ -106,7 +106,7 @@ See [`openapi.yaml`](openapi.yaml) for the HTTP contract. The Rust, TypeScript, 
 - Backups must include the database and the exact master-key version. Test restoration before reducing backup retention.
 - Set retention values deliberately. The process refuses zero values.
 - Rotate operational delegations rather than long-lived account keys. Revocation invalidates all sessions backed by that delegation immediately.
-- Scrape `GET /metrics` for lock-free message, retry, cumulative insert-time, authorization-refresh, SSE-resync, authorization-close, maintenance-deletion, active-SSE, in-flight-message, TLS connection/handshake, and current/maximum event-loop-lag metrics. TLS labels contain only the bounded transport name. Monitor `429` responses and retention deletion warnings alongside these counters.
+- Scrape `GET /metrics` for lock-free message, retry, cumulative insert-time, authorization-refresh, SSE-resync, authorization-close, maintenance-deletion, active-SSE, in-flight-message, TLS connection/handshake/rejection, and current/maximum event-loop-lag metrics. TLS labels contain only the bounded transport name. Direct TLS retains one connection permit per live socket and caps sockets at the configured SSE capacity plus ordinary-request capacity. Monitor `429` responses and retention deletion warnings alongside these counters.
 - Size the reverse proxy for at least the configured `max_sse_connections`; ordinary-request concurrency is isolated from long-lived streams so 10,000 idle SSE clients do not consume every message/API request slot.
 
 ## Verification

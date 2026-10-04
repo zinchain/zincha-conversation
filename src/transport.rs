@@ -307,30 +307,14 @@ pub async fn profile_http_client(
             }
             _ => continue,
         };
-        let parsed = url::Url::parse(&base_url)
-            .map_err(|error| Error::Invalid(format!("parse profile interface: {error}")))?;
-        let host = parsed
-            .host_str()
-            .ok_or_else(|| Error::Invalid("profile interface has no host".to_string()))?;
-        let port = parsed
-            .port_or_known_default()
-            .ok_or_else(|| Error::Invalid("profile interface has no port".to_string()))?;
-        let reachable = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            tokio::net::TcpStream::connect((host, port)),
-        )
-        .await
-        .is_ok_and(|result| result.is_ok());
-        if !reachable {
-            unreachable.push(format!("{host}:{port}"));
-            if policy == ClientTransportPolicy::Auto {
+        match verify_live_profile(&client, &base_url, profile).await {
+            Ok(()) => {}
+            Err(LiveProfileError::Reachability(_)) if policy == ClientTransportPolicy::Auto => {
+                unreachable.push(base_url);
                 continue;
             }
-            return Err(Error::Unavailable(format!(
-                "conversation interface {host}:{port} is unreachable"
-            )));
+            Err(error) => return Err(error.into_error()),
         }
-        verify_live_profile(&client, &base_url, profile).await?;
         return Ok(ProfileHttpClient {
             client,
             base_url,
@@ -385,47 +369,90 @@ fn pinned_client(
         .map_err(|error| Error::Internal(format!("build pinned TLS client: {error}")))
 }
 
+enum LiveProfileError {
+    Reachability(Error),
+    Terminal(Error),
+}
+
+impl LiveProfileError {
+    fn into_error(self) -> Error {
+        match self {
+            Self::Reachability(error) | Self::Terminal(error) => error,
+        }
+    }
+}
+
 async fn verify_live_profile(
     client: &reqwest::Client,
     base_url: &str,
     expected: &ConversationProfileV2,
-) -> Result<()> {
+) -> std::result::Result<(), LiveProfileError> {
     let response = client
         .get(format!("{base_url}/v1/profile"))
         .send()
         .await
-        .map_err(|error| Error::Unavailable(format!("fetch live profile: {error}")))?;
+        .map_err(|error| {
+            let failure = Error::Unavailable(format!("fetch live profile: {error}"));
+            if is_reachability_error(&error) {
+                LiveProfileError::Reachability(failure)
+            } else {
+                LiveProfileError::Terminal(failure)
+            }
+        })?;
     if !response.status().is_success() {
-        return Err(Error::Unavailable(format!(
+        return Err(LiveProfileError::Terminal(Error::Unavailable(format!(
             "live profile returned HTTP {}",
             response.status()
-        )));
+        ))));
     }
     let mut bytes = Vec::new();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk =
-            chunk.map_err(|error| Error::Unavailable(format!("read live profile: {error}")))?;
+        let chunk = chunk.map_err(|error| {
+            LiveProfileError::Terminal(Error::Unavailable(format!("read live profile: {error}")))
+        })?;
         if bytes.len().saturating_add(chunk.len()) > 8 * 1024 {
-            return Err(Error::Invalid(
+            return Err(LiveProfileError::Terminal(Error::Invalid(
                 "live profile response exceeds bounded limit".to_string(),
-            ));
+            )));
         }
         bytes.extend_from_slice(&chunk);
     }
-    let envelope: ProfileEnvelope = serde_json::from_slice(&bytes)
-        .map_err(|error| Error::Invalid(format!("decode live profile: {error}")))?;
-    let live = envelope
-        .data
-        .filter(|_| envelope.success)
-        .ok_or_else(|| Error::Invalid("live profile response is unsuccessful".to_string()))?;
-    validate_profile(&live)?;
+    let envelope: ProfileEnvelope = serde_json::from_slice(&bytes).map_err(|error| {
+        LiveProfileError::Terminal(Error::Invalid(format!("decode live profile: {error}")))
+    })?;
+    let live = envelope.data.filter(|_| envelope.success).ok_or_else(|| {
+        LiveProfileError::Terminal(Error::Invalid(
+            "live profile response is unsuccessful".to_string(),
+        ))
+    })?;
+    validate_profile(&live).map_err(LiveProfileError::Terminal)?;
     if &live != expected {
-        return Err(Error::Authentication(
+        return Err(LiveProfileError::Terminal(Error::Authentication(
             "live conversation profile does not match authenticated metadata".to_string(),
-        ));
+        )));
     }
     Ok(())
+}
+
+fn is_reachability_error(error: &reqwest::Error) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    let mut reachable_io_failure = false;
+    while let Some(cause) = source {
+        if let Some(cause) = cause.downcast_ref::<std::io::Error>() {
+            reachable_io_failure |= matches!(
+                cause.kind(),
+                std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::NotConnected
+                    | std::io::ErrorKind::AddrNotAvailable
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::NetworkUnreachable
+                    | std::io::ErrorKind::HostUnreachable
+            );
+        }
+        source = cause.source();
+    }
+    error.is_timeout() || reachable_io_failure
 }
 
 pub fn validate_profile(profile: &ConversationProfileV2) -> Result<()> {
@@ -631,6 +658,23 @@ fn load_certificate(
     ) {
         return Err(Error::Invalid(
             "TLS certificate must use Ed25519, ECDSA-SHA256, or ECDSA-SHA384".to_string(),
+        ));
+    }
+    let public_key_algorithm = &parsed.public_key().algorithm;
+    let public_key_oid = public_key_algorithm.algorithm.to_id_string();
+    let approved_public_key = match public_key_oid.as_str() {
+        "1.3.101.112" => public_key_algorithm.parameters.is_none(),
+        "1.2.840.10045.2.1" => public_key_algorithm
+            .parameters
+            .as_ref()
+            .and_then(|parameters| parameters.as_oid().ok())
+            .map(|curve| curve.to_id_string())
+            .is_some_and(|curve| matches!(curve.as_str(), "1.2.840.10045.3.1.7" | "1.3.132.0.34")),
+        _ => false,
+    };
+    if !approved_public_key {
+        return Err(Error::Invalid(
+            "TLS certificate must use an Ed25519, P-256, or P-384 public key".to_string(),
         ));
     }
     if let Some(expected_ip) = expected_ip {

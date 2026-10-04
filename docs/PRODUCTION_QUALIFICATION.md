@@ -22,7 +22,8 @@ For every run capture:
   table/index growth, lock waits, checkpoints, and storage throttling;
 - retention rows eligible, visited, and deleted before and after the run;
 - reverse-proxy connection count, direct-TLS active connections, handshakes,
-  failures, timeouts and cumulative latency, rejection count, and network errors.
+  failures, timeouts and cumulative latency, connection-capacity rejection
+  count, and network errors.
 
 Do not repair or omit a failed observation. A missing metric or incomplete
 sequence span is an inconclusive run.
