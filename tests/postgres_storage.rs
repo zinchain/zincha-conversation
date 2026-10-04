@@ -46,7 +46,7 @@ async fn postgres_atomic_session_and_concurrent_message_retry() {
                     "autovacuum_analyze_threshold".to_string(),
                 ))
                 .map(String::as_str),
-            Some("100000")
+            Some("250000")
         );
         assert_eq!(
             maintenance_options
@@ -55,7 +55,7 @@ async fn postgres_atomic_session_and_concurrent_message_retry() {
                     "autovacuum_vacuum_insert_threshold".to_string(),
                 ))
                 .map(String::as_str),
-            Some("100000")
+            Some("250000")
         );
         for option in [
             "autovacuum_analyze_scale_factor",
@@ -66,7 +66,7 @@ async fn postgres_atomic_session_and_concurrent_message_retry() {
                 .unwrap()
                 .parse::<f64>()
                 .unwrap();
-            assert_eq!(scale, 1.0);
+            assert_eq!(scale, 0.0);
         }
     }
 
