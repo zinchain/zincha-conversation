@@ -172,12 +172,13 @@ where
             })?;
             let started = std::time::Instant::now();
             metrics.tls_handshakes.fetch_add(1, Ordering::Relaxed);
-            match inner.accept(stream, service).await {
+            let outcome = inner.accept(stream, service).await;
+            metrics.tls_handshake_micros.fetch_add(
+                started.elapsed().as_micros().min(u64::MAX as u128) as u64,
+                Ordering::Relaxed,
+            );
+            match outcome {
                 Ok((stream, service)) => {
-                    metrics.tls_handshake_micros.fetch_add(
-                        started.elapsed().as_micros().min(u64::MAX as u128) as u64,
-                        Ordering::Relaxed,
-                    );
                     let connection_permit =
                         connection_permits.try_acquire_owned().map_err(|_| {
                             metrics

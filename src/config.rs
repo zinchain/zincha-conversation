@@ -261,6 +261,7 @@ impl Config {
         }
         let mut advertised = BTreeSet::new();
         let mut zincha_tls_count = 0usize;
+        let mut direct_tls_listen = None;
         for interface in &self.service.interfaces {
             let identity = match interface {
                 ServiceInterfaceConfig::Https { url } => {
@@ -284,12 +285,13 @@ impl Config {
                 ServiceInterfaceConfig::ZinchaTlsV1 {
                     host,
                     port,
+                    listen,
                     certificate_file,
                     private_key_file,
                     next_certificate_file,
-                    ..
                 } => {
                     zincha_tls_count += 1;
+                    direct_tls_listen = Some(*listen);
                     let ip: IpAddr = host.parse().map_err(|_| {
                         Error::Invalid(
                             "zincha_tls_v1 host must be a literal IPv4 or IPv6 address".to_string(),
@@ -322,6 +324,11 @@ impl Config {
         if zincha_tls_count > 1 {
             return Err(Error::Invalid(
                 "only one direct zincha_tls_v1 listener is supported".to_string(),
+            ));
+        }
+        if direct_tls_listen.is_some_and(|listen| socket_addresses_overlap(self.listen, listen)) {
+            return Err(Error::Invalid(
+                "private HTTP and zincha_tls_v1 listeners must not overlap".to_string(),
             ));
         }
         if self.service.privacy_modes.is_empty()
@@ -482,6 +489,11 @@ impl Config {
     }
 }
 
+fn socket_addresses_overlap(left: SocketAddr, right: SocketAddr) -> bool {
+    left.port() == right.port()
+        && (left.ip() == right.ip() || left.ip().is_unspecified() || right.ip().is_unspecified())
+}
+
 fn secure_http_url(url: &url::Url) -> bool {
     url.host_str().is_some()
         && url.username().is_empty()
@@ -593,6 +605,48 @@ backups_secs = 1
             *host = "2001:0db8::25".to_string();
         }
         assert!(noncanonical.validate().is_err());
+    }
+
+    #[test]
+    fn private_and_direct_tls_listeners_must_not_overlap() {
+        let mut config = example();
+        config.service.interfaces.insert(
+            0,
+            ServiceInterfaceConfig::ZinchaTlsV1 {
+                host: "203.0.113.25".to_string(),
+                port: 443,
+                listen: "0.0.0.0:8443".parse().unwrap(),
+                certificate_file: "/tmp/certificate.pem".into(),
+                private_key_file: "/tmp/private-key.pem".into(),
+                next_certificate_file: None,
+            },
+        );
+        let private_listen = config.listen;
+        set_direct_tls_listen(&mut config, private_listen);
+        assert!(config.validate().is_err());
+
+        set_direct_tls_listen(
+            &mut config,
+            format!("0.0.0.0:{}", private_listen.port())
+                .parse()
+                .unwrap(),
+        );
+        assert!(config.validate().is_err());
+
+        set_direct_tls_listen(&mut config, "0.0.0.0:8443".parse().unwrap());
+        config.validate().unwrap();
+    }
+
+    fn set_direct_tls_listen(config: &mut Config, address: SocketAddr) {
+        let Some(ServiceInterfaceConfig::ZinchaTlsV1 { listen, .. }) = config
+            .service
+            .interfaces
+            .iter_mut()
+            .find(|interface| matches!(interface, ServiceInterfaceConfig::ZinchaTlsV1 { .. }))
+        else {
+            panic!("example must advertise direct TLS");
+        };
+        *listen = address;
     }
 
     #[test]
