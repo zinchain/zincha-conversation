@@ -61,6 +61,12 @@ fn openapi_is_valid_and_covers_the_public_router() {
             .as_u64(),
         Some(443)
     );
+    assert_eq!(
+        document["components"]["schemas"]["ConversationProfile"]["properties"]["protocol_versions"]
+            ["items"]["maximum"]
+            .as_u64(),
+        Some(u16::MAX as u64)
+    );
     for strict_schema in [
         "ChallengeRequest",
         "SessionRequest",

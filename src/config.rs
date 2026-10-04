@@ -241,9 +241,9 @@ impl Config {
 
     pub fn validate(&self) -> Result<()> {
         if self.service.service_id.trim().is_empty()
-            || self.service.service_id.len() > 256
+            || self.service.service_id.chars().count() > 256
             || self.service.tenant_id.trim().is_empty()
-            || self.service.tenant_id.len() > 128
+            || self.service.tenant_id.chars().count() > 128
         {
             return Err(Error::Invalid(
                 "service_id and tenant_id are required and must be bounded".to_string(),

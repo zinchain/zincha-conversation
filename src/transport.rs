@@ -461,7 +461,7 @@ pub fn validate_profile(profile: &ConversationProfileV2) -> Result<()> {
     if profile.version != PROFILE_VERSION
         || !profile.protocol_versions.contains(&PROTOCOL_VERSION)
         || profile.service_id.trim().is_empty()
-        || profile.service_id.len() > 256
+        || profile.service_id.chars().count() > 256
         || profile.service_id.chars().any(char::is_control)
         || profile.interfaces.is_empty()
         || profile.interfaces.len() > 4
@@ -813,9 +813,31 @@ mod tests {
         certificate_pins.push(certificate_pins[0].clone());
         assert!(validate_profile(&profile).is_err());
 
+        let vector: serde_json::Value = serde_json::from_str(include_str!(
+            "../testdata/golden-conversation-profile-v2.json"
+        ))
+        .unwrap();
+        profile = serde_json::from_value(vector["profile"].clone()).unwrap();
+        let ConversationInterface::ZinchaTlsV1 {
+            certificate_pins, ..
+        } = &mut profile.interfaces[0]
+        else {
+            unreachable!()
+        };
+        certificate_pins[0].sha256 = "AB".repeat(32);
+        assert!(validate_profile(&profile).is_err());
+
         profile.interfaces = vec![ConversationInterface::Https {
             url: format!("https://example.test/{}", "x".repeat(2_049)),
         }];
+        assert!(validate_profile(&profile).is_err());
+
+        profile.interfaces = vec![ConversationInterface::Https {
+            url: "https://example.test".to_string(),
+        }];
+        profile.service_id = "💻".repeat(256);
+        assert!(validate_profile(&profile).is_ok());
+        profile.service_id.push('💻');
         assert!(validate_profile(&profile).is_err());
     }
 

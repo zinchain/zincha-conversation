@@ -259,7 +259,7 @@ components:
           minItems: 1
           maxItems: 64
           uniqueItems: true
-          items: { type: integer, minimum: 1 }
+          items: { type: integer, minimum: 1, maximum: 65535 }
     ConversationInterface:
       oneOf:
         - $ref: "#/components/schemas/HttpsConversationInterface"
