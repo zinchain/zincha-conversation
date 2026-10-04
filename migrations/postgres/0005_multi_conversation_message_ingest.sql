@@ -128,15 +128,14 @@ BEGIN
     ),
     existing_messages AS MATERIALIZED (
         SELECT message.*
-          FROM messages AS message
-          JOIN requested_conversations AS requested
-            ON requested.conversation_id = message.conversation_id
-         WHERE EXISTS (
-                   SELECT 1
+          FROM (
+                   SELECT DISTINCT candidate.conversation_id,
+                                   candidate.message_id
                      FROM ranked_input AS candidate
-                    WHERE candidate.conversation_id = message.conversation_id
-                      AND candidate.message_id = message.message_id
-               )
+               ) AS requested
+          JOIN messages AS message
+            ON message.conversation_id = requested.conversation_id
+           AND message.message_id = requested.message_id
     ),
     new_candidates AS MATERIALIZED (
         SELECT ranked.*,
