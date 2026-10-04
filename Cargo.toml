@@ -57,3 +57,5 @@ x509-parser = "0.18"
 serde_yaml = "0.9"
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
+zincha-client = { git = "https://github.com/zinchain/zincha-sdk.git", rev = "29bc9f20fd82be069bd770a212695ef89da93ac8" }
+zincha-primitives = { git = "https://github.com/zinchain/zincha-sdk.git", rev = "29bc9f20fd82be069bd770a212695ef89da93ac8" }

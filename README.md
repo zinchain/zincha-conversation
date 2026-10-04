@@ -124,7 +124,11 @@ gaps, immediate revocation, challenge throttling, immutable privacy modes,
 payload-mode enforcement, participant-role projection, coherent chain
 observation, bounded lifecycle pagination, shared stale-authorization refresh,
 SSE replay/live handoff and lag recovery, bounded retention, cryptographic
-context binding, and rejection of non-contributory X25519 public keys.
+context binding, and rejection of non-contributory X25519 public keys. A
+cross-repository integration test starts the real pinned-TLS service and uses
+the pinned public Rust SDK as independently authenticated requester and
+provider agents. It verifies bidirectional live delivery, signed replies,
+idempotent retry, acknowledgements, and identical durable message history.
 
 SQLite integration tests run on every local and CI invocation. PostgreSQL is
 the production backend and must also pass the staging and resource gates in

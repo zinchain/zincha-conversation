@@ -4,6 +4,7 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -16,6 +17,8 @@ use futures_util::StreamExt;
 use tempfile::TempDir;
 use tower::ServiceExt;
 use uuid::Uuid;
+use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
+use zincha_client::conversation as sdk;
 use zincha_conversation::{
     chain::AuthorizationSource,
     config::{
@@ -39,6 +42,7 @@ use zincha_conversation::{
     },
     Config, ConversationService,
 };
+use zincha_primitives::crypto::Keypair;
 
 #[derive(serde::Deserialize)]
 struct ApiResponse<T> {
@@ -320,6 +324,326 @@ fn signed_message(
             .to_bytes(),
     );
     request
+}
+
+async fn authenticate_sdk_agent(
+    client: sdk::ConversationClient,
+    account: &Keypair,
+    operational: &Keypair,
+    subject: &sdk::SubjectRef,
+    home_service_id: &str,
+    encryption_secret: [u8; 32],
+) -> (sdk::ConversationClient, Uuid) {
+    let challenge = client
+        .issue_challenge(&sdk::ChallengeRequest {
+            participant_address: account.address().to_string(),
+            subject: subject.clone(),
+        })
+        .await
+        .unwrap();
+    let encryption_public = X25519PublicKey::from(&StaticSecret::from(encryption_secret));
+    let delegation = sdk::create_delegation(
+        account,
+        operational,
+        *encryption_public.as_bytes(),
+        sdk::CreateDelegationOptions {
+            subject: subject.clone(),
+            home_service_id: home_service_id.to_string(),
+            not_before_ms: sdk::now_ms() - 1_000,
+            expires_at_ms: sdk::now_ms() + 3_600_000,
+            capabilities: vec!["read".to_string(), "write".to_string()],
+        },
+    )
+    .unwrap();
+    let delegation_id = delegation.delegation_id;
+    let session = client
+        .create_session(&sdk::SessionRequest {
+            challenge_id: challenge.challenge_id,
+            delegation,
+            challenge_signature: sdk::challenge_signature(operational, &challenge),
+        })
+        .await
+        .unwrap();
+    (
+        client.with_access_token(session.access_token),
+        delegation_id,
+    )
+}
+
+fn active_sse_connections(service: &ConversationService) -> usize {
+    service
+        .metrics_text()
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("zincha_conversation_active_sse_connections ")
+                .and_then(|value| value.parse().ok())
+        })
+        .unwrap()
+}
+
+async fn wait_for_active_sse_connections(service: &ConversationService, expected: usize) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if active_sse_connections(service) == expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("SSE connection count did not become {expected}"));
+}
+
+#[tokio::test]
+async fn requester_and_provider_agents_exchange_messages_end_to_end() {
+    let fixture = fixture().await;
+    let certificate = fixture._temp.path().join("agent-e2e-certificate.pem");
+    let private_key = fixture._temp.path().join("agent-e2e-key.pem");
+    generate_identity("127.0.0.1", &certificate, &private_key, 30).unwrap();
+
+    let tls_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    tls_listener.set_nonblocking(true).unwrap();
+    let tls_address = tls_listener.local_addr().unwrap();
+    let mut config = (*fixture.service.config).clone();
+    config.service.interfaces = vec![ServiceInterfaceConfig::ZinchaTlsV1 {
+        host: "127.0.0.1".to_string(),
+        port: tls_address.port(),
+        listen: tls_address,
+        certificate_file: certificate,
+        private_key_file: private_key,
+        next_certificate_file: None,
+    }];
+    let direct_tls = prepare_service_transport(&config)
+        .unwrap()
+        .direct_tls
+        .unwrap();
+    let snapshot = SubjectSnapshot {
+        subject: fixture.subject.clone(),
+        status: "matched".to_string(),
+        provider: fixture.provider.clone(),
+        participants: vec![
+            Participant {
+                address: fixture.participant.clone(),
+                roles: vec![ParticipantRole::Requester],
+                can_read: true,
+                can_write: true,
+            },
+            Participant {
+                address: fixture.provider.clone(),
+                roles: vec![ParticipantRole::Provider],
+                can_read: true,
+                can_write: true,
+            },
+        ],
+        terminal_at_ms: None,
+        write_until_ms: None,
+        lifecycle_seq: Some(2),
+        observed_height: 42,
+        observed_block_hash: "cd".repeat(32),
+        observed_at_ms: now_ms(),
+        digest: "ef".repeat(32),
+    };
+    let service = ConversationService::new(
+        config,
+        fixture.service.db.clone(),
+        Arc::new(StaticAuthorization {
+            snapshot,
+            calls: Arc::new(AtomicUsize::new(0)),
+            block_next: Arc::new(AtomicBool::new(false)),
+            blocked_call_started: Arc::new(tokio::sync::Semaphore::new(0)),
+            blocked_call_release: Arc::new(tokio::sync::Semaphore::new(0)),
+        }),
+        LocalMasterKey::from_hex(&"44".repeat(32)).unwrap(),
+    )
+    .await
+    .unwrap();
+    service.migrate().await.unwrap();
+
+    let tls_handle = axum_server::Handle::new();
+    let tls_server = axum_server::from_tcp(tls_listener)
+        .unwrap()
+        .acceptor(axum_server::tls_rustls::RustlsAcceptor::new(
+            direct_tls.rustls,
+        ))
+        .handle(tls_handle.clone());
+    let tls_task = tokio::spawn(
+        tls_server.serve(zincha_conversation::api::router(service.clone()).into_make_service()),
+    );
+    tls_handle.listening().await.unwrap();
+
+    let profile: sdk::ConversationProfileV2 =
+        serde_json::from_value(serde_json::to_value(service.profile()).unwrap()).unwrap();
+    let requester_account = Keypair::from_secret_bytes(&[7; 32]);
+    let requester_operational = Keypair::from_secret_bytes(&[9; 32]);
+    let provider_account = Keypair::from_secret_bytes(&[11; 32]);
+    let provider_operational = Keypair::from_secret_bytes(&[13; 32]);
+    assert_eq!(requester_account.address().to_string(), fixture.participant);
+    assert_eq!(provider_account.address().to_string(), fixture.provider);
+
+    let requester = sdk::ConversationClient::from_profile(
+        &profile,
+        sdk::ConversationTransportPolicy::ZinchaTlsOnly,
+    )
+    .await
+    .unwrap();
+    let provider = sdk::ConversationClient::from_profile(
+        &profile,
+        sdk::ConversationTransportPolicy::ZinchaTlsOnly,
+    )
+    .await
+    .unwrap();
+    let subject = sdk::SubjectRef {
+        network: fixture.subject.network.clone(),
+        chain_id: fixture.subject.chain_id.clone(),
+        kind: sdk::SubjectKind::Task,
+        id: fixture.subject.id.clone(),
+    };
+    let (requester, requester_delegation) = authenticate_sdk_agent(
+        requester,
+        &requester_account,
+        &requester_operational,
+        &subject,
+        &profile.service_id,
+        [31; 32],
+    )
+    .await;
+    let (provider, provider_delegation) = authenticate_sdk_agent(
+        provider,
+        &provider_account,
+        &provider_operational,
+        &subject,
+        &profile.service_id,
+        [32; 32],
+    )
+    .await;
+
+    let resolution = sdk::ResolveConversationRequest {
+        subject,
+        provider_address: fixture.provider.clone(),
+        privacy_mode: sdk::PrivacyMode::PlatformReadable,
+    };
+    let requester_conversation = requester.resolve(&resolution).await.unwrap();
+    let provider_conversation = provider.resolve(&resolution).await.unwrap();
+    assert_eq!(requester_conversation.id, provider_conversation.id);
+    let conversation_id = requester_conversation.id;
+
+    let provider_events = provider.events(conversation_id.clone(), 0);
+    let provider_receive = tokio::spawn(async move {
+        tokio::pin!(provider_events);
+        tokio::time::timeout(Duration::from_secs(5), provider_events.next())
+            .await
+            .expect("provider did not receive requester message")
+            .expect("provider SSE stream ended")
+            .expect("provider SSE stream failed")
+    });
+    wait_for_active_sse_connections(&service, 1).await;
+
+    let request = sdk::sign_message(
+        &requester_operational,
+        requester_delegation,
+        &conversation_id,
+        &fixture.participant,
+        sdk::MessagePayload::Plaintext {
+            parts: vec![sdk::MessagePart::Text {
+                text: "Can you produce the requested artifact?".to_string(),
+            }],
+        },
+        None,
+        None,
+    )
+    .unwrap();
+    let requester_message = requester.submit(&conversation_id, &request).await.unwrap();
+    let provider_received = provider_receive.await.unwrap();
+    assert_eq!(provider_received.sequence, 1);
+    assert_eq!(provider_received.message_id, requester_message.message_id);
+    assert_eq!(provider_received.sender, fixture.participant);
+    assert_eq!(provider_received.payload, request.payload);
+
+    let retry = requester.submit(&conversation_id, &request).await.unwrap();
+    assert_eq!(retry.sequence, 1);
+    assert_eq!(retry.message_id, requester_message.message_id);
+    provider
+        .acknowledge(&conversation_id, provider_received.sequence)
+        .await
+        .unwrap();
+    wait_for_active_sse_connections(&service, 0).await;
+
+    let requester_events = requester.events(conversation_id.clone(), 1);
+    let requester_receive = tokio::spawn(async move {
+        tokio::pin!(requester_events);
+        tokio::time::timeout(Duration::from_secs(5), requester_events.next())
+            .await
+            .expect("requester did not receive provider reply")
+            .expect("requester SSE stream ended")
+            .expect("requester SSE stream failed")
+    });
+    wait_for_active_sse_connections(&service, 1).await;
+
+    let reply = sdk::sign_message(
+        &provider_operational,
+        provider_delegation,
+        &conversation_id,
+        &fixture.provider,
+        sdk::MessagePayload::Plaintext {
+            parts: vec![sdk::MessagePart::Text {
+                text: "Yes. Production has started.".to_string(),
+            }],
+        },
+        Some(requester_message.message_id),
+        None,
+    )
+    .unwrap();
+    let provider_message = provider.submit(&conversation_id, &reply).await.unwrap();
+    let requester_received = requester_receive.await.unwrap();
+    assert_eq!(requester_received.sequence, 2);
+    assert_eq!(requester_received.message_id, provider_message.message_id);
+    assert_eq!(requester_received.sender, fixture.provider);
+    assert_eq!(
+        requester_received.reply_to,
+        Some(requester_message.message_id)
+    );
+    assert_eq!(requester_received.payload, reply.payload);
+
+    requester
+        .acknowledge(&conversation_id, requester_received.sequence)
+        .await
+        .unwrap();
+    provider
+        .acknowledge(&conversation_id, requester_received.sequence)
+        .await
+        .unwrap();
+    wait_for_active_sse_connections(&service, 0).await;
+
+    let requester_page = requester.messages(&conversation_id, 0, 100).await.unwrap();
+    let provider_page = provider.messages(&conversation_id, 0, 100).await.unwrap();
+    assert_eq!(requester_page.items.len(), 2);
+    assert_eq!(provider_page.items.len(), 2);
+    assert_eq!(
+        requester_page.items[0].message_id,
+        requester_message.message_id
+    );
+    assert_eq!(
+        requester_page.items[1].message_id,
+        provider_message.message_id
+    );
+    assert_eq!(
+        requester_page
+            .items
+            .iter()
+            .map(|message| message.message_id)
+            .collect::<Vec<_>>(),
+        provider_page
+            .items
+            .iter()
+            .map(|message| message.message_id)
+            .collect::<Vec<_>>()
+    );
+    let metrics = service.metrics_text();
+    assert!(metrics.contains("zincha_conversation_messages_inserted_total 2"));
+    assert!(metrics.contains("zincha_conversation_message_retries_total 1"));
+
+    tls_handle.shutdown();
+    tls_task.await.unwrap().unwrap();
 }
 
 #[tokio::test]
