@@ -27,6 +27,14 @@ For every run capture:
   failures, timeouts and cumulative latency, connection-capacity rejection
   count, and network errors.
 
+Progress sampling must be constant-time relative to retained history. Read the
+conversation's `next_sequence` and, when needed, perform primary-key existence
+checks for only the last message and event. Do not run `COUNT(*)`,
+`COUNT(DISTINCT ...)`, broad `MIN`/`MAX`, or whole-history reconciliation while
+load is active. Those scans can evict the working set and spill temporary data,
+turning the monitor into the measured bottleneck. Run exact grouped
+message/event continuity reconciliation once, after load generation stops.
+
 Do not repair or omit a failed observation. A missing metric or incomplete
 sequence span is an inconclusive run.
 
@@ -130,6 +138,11 @@ mixed traffic. Compare CPU seconds per accepted message and warmed/high-water
 RSS with the unchanged HTTP application baseline; any material regression or
 growing handshake/backlog debt leaves qualification pending.
 
+For HTTPS, validate the provider hostname before the run and keep its DNS
+resolution stable for the entire connection lifecycle. Use the bounded
+upstream keepalive pool in `deploy/nginx-https.conf.example`; without upstream
+pooling, the proxy adds a backend TCP handshake to every message.
+
 The driver consumes the authenticated on-chain profile and verifies the live
 `/v1/profile` response before requesting a challenge. Set `transport_policy`
 to `https_only` or `zincha_tls_only` for the isolated arms. Run both predeclared
@@ -179,13 +192,17 @@ Run 9,900 idle streams and 100 active streams concurrently. Run a bounded
 message driver against only the active conversation during the hold interval.
 Raise the load-generator file-descriptor limit before starting.
 
-The SSE driver shards streams across bounded HTTP client pools at the direct
-listener's declared 128-stream HTTP/2 limit. It reuses one pooled TLS
-connection per shard where HTTP/2 is available, rather than paying one TLS
-handshake per SSE stream. The report records `client_pools`; compare that with
-the service handshake counters and reject unexplained excess handshakes. Its
-request deadline covers the complete declared ramp, hold interval, and a
-60-second connection margin.
+The SSE driver shards streams across bounded 100-stream HTTP client pools.
+This is the lower common bound of the direct listener's declared 128-stream
+limit and the private Axum HTTP/2 listener's standard 100-stream limit. It
+reuses one pooled TLS connection per shard where HTTP/2 is available, rather
+than paying one TLS handshake per SSE stream. For Web-PKI, use an HTTP/2
+backend such as `deploy/haproxy-https.cfg.example`; an HTTP/1.1 upstream proxy
+requires one backend socket and its service-side state per SSE stream. The
+report records `client_pools`; compare that with the service and proxy
+connection counters and reject unexplained excess connections. Its request
+deadline covers the complete declared ramp, hold interval, and a 60-second
+connection margin.
 
 ```sh
 cargo run --release --example qualification_sse -- \

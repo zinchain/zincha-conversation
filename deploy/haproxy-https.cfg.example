@@ -1,0 +1,24 @@
+global
+    maxconn 20000
+    log stdout format raw local0
+
+defaults
+    mode http
+    log global
+    option httplog
+    # Do not duplicate a long-lived SSE GET while a backend HTTP/2 connection
+    # is expanding. Client reconnect/replay is the single retry authority.
+    retries 0
+    timeout connect 5s
+    timeout client 3600s
+    timeout server 3600s
+
+frontend zincha_conversation_https
+    bind :443 ssl crt /etc/zincha-conversation/https.pem alpn h2,http/1.1 ssl-min-ver TLSv1.3 ssl-max-ver TLSv1.3
+    default_backend zincha_conversation_h2c
+
+backend zincha_conversation_h2c
+    # The private listener supports cleartext HTTP/2. Backend multiplexing is
+    # essential for large SSE populations: it avoids one backend TCP socket
+    # and its service-side connection state for every downstream stream.
+    server conversation 127.0.0.1:9988 proto h2 maxconn 20000
