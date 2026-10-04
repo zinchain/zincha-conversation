@@ -1,11 +1,14 @@
 global
     maxconn 20000
-    log stdout format raw local0
+    # Preserve operational warnings without serializing every conversation
+    # path into journald on the throughput-critical request path.
+    log stdout format raw local0 warning
 
 defaults
     mode http
     log global
     option httplog
+    option dontlog-normal
     # Do not duplicate a long-lived SSE GET while a backend HTTP/2 connection
     # is expanding. Client reconnect/replay is the single retry authority.
     retries 0
