@@ -1,4 +1,5 @@
 use std::{
+    fmt,
     fs::{self, OpenOptions},
     io::{BufReader, Write},
     net::IpAddr,
@@ -51,6 +52,44 @@ pub struct PreparedServiceTransport {
 struct LoadedCertificate {
     chain: Vec<CertificateDer<'static>>,
     pin: TlsCertificatePin,
+}
+
+#[derive(Debug)]
+struct ConversationDnsError(std::io::Error);
+
+impl fmt::Display for ConversationDnsError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "conversation endpoint DNS lookup failed: {}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for ConversationDnsError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+#[derive(Debug)]
+struct ConversationDnsResolver;
+
+impl reqwest::dns::Resolve for ConversationDnsResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            let addresses =
+                tokio::net::lookup_host(format!("{host}:0"))
+                    .await
+                    .map_err(|error| {
+                        Box::new(ConversationDnsError(error))
+                            as Box<dyn std::error::Error + Send + Sync>
+                    })?;
+            Ok(Box::new(addresses) as reqwest::dns::Addrs)
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -282,6 +321,7 @@ pub async fn profile_http_client(
                 (
                     url.trim_end_matches('/').to_string(),
                     reqwest::Client::builder()
+                        .dns_resolver(Arc::new(ConversationDnsResolver))
                         .connect_timeout(std::time::Duration::from_secs(5))
                         .timeout(request_timeout)
                         .pool_max_idle_per_host(idle_connections)
@@ -363,6 +403,7 @@ fn pinned_client(
     tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     tls.enable_early_data = false;
     reqwest::Client::builder()
+        .dns_resolver(Arc::new(ConversationDnsResolver))
         .use_preconfigured_tls(tls)
         .connect_timeout(std::time::Duration::from_secs(5))
         .timeout(request_timeout)
@@ -440,7 +481,10 @@ async fn verify_live_profile(
 fn is_reachability_error(error: &reqwest::Error) -> bool {
     let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
     let mut reachable_io_failure = false;
+    let mut dns_failure = false;
+    let mut tls_failure = false;
     while let Some(cause) = source {
+        dns_failure |= cause.downcast_ref::<ConversationDnsError>().is_some();
         if let Some(cause) = cause.downcast_ref::<std::io::Error>() {
             reachable_io_failure |= matches!(
                 cause.kind(),
@@ -452,9 +496,10 @@ fn is_reachability_error(error: &reqwest::Error) -> bool {
                     | std::io::ErrorKind::HostUnreachable
             );
         }
+        tls_failure |= cause.downcast_ref::<rustls::Error>().is_some();
         source = cause.source();
     }
-    error.is_timeout() || reachable_io_failure
+    !tls_failure && (error.is_timeout() || dns_failure || reachable_io_failure)
 }
 
 pub fn validate_profile(profile: &ConversationProfileV2) -> Result<()> {
