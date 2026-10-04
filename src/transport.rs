@@ -34,6 +34,8 @@ use crate::{
 
 const CERTIFICATE_CLOCK_SKEW_MS: i64 = 5 * 60 * 1_000;
 const MAX_CERTIFICATE_BYTES: usize = 64 * 1024;
+const MAX_HTTPS_INTERFACE_URL_LENGTH: usize = 2_048;
+const MAX_PROTOCOL_VERSIONS: usize = 64;
 
 #[derive(Clone)]
 pub struct PreparedDirectTls {
@@ -470,6 +472,7 @@ pub fn validate_profile(profile: &ConversationProfileV2) -> Result<()> {
             .enumerate()
             .any(|(index, mode)| profile.privacy_modes[..index].contains(mode))
         || profile.protocol_versions.is_empty()
+        || profile.protocol_versions.len() > MAX_PROTOCOL_VERSIONS
         || profile.protocol_versions.contains(&0)
         || profile
             .protocol_versions
@@ -494,6 +497,11 @@ pub fn validate_profile(profile: &ConversationProfileV2) -> Result<()> {
     for interface in &profile.interfaces {
         let identity = match interface {
             ConversationInterface::Https { url } => {
+                if url.len() > MAX_HTTPS_INTERFACE_URL_LENGTH {
+                    return Err(Error::Invalid(
+                        "HTTPS profile URL exceeds the supported length".to_string(),
+                    ));
+                }
                 let parsed = url::Url::parse(url)
                     .map_err(|_| Error::Invalid("HTTPS profile URL is invalid".to_string()))?;
                 if parsed.scheme() != "https"
@@ -767,6 +775,39 @@ fn write_new_file(path: &Path, bytes: &[u8], private: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profile_v2_matches_cross_language_golden_vector() {
+        let vector: serde_json::Value = serde_json::from_str(include_str!(
+            "../testdata/golden-conversation-profile-v2.json"
+        ))
+        .unwrap();
+        let profile: ConversationProfileV2 =
+            serde_json::from_value(vector["profile"].clone()).unwrap();
+        validate_profile(&profile).unwrap();
+        assert_eq!(
+            String::from_utf8(serde_jcs::to_vec(&profile).unwrap()).unwrap(),
+            vector["canonical_json"].as_str().unwrap()
+        );
+    }
+
+    #[test]
+    fn profile_v2_enforces_openapi_collection_and_url_bounds() {
+        let vector: serde_json::Value = serde_json::from_str(include_str!(
+            "../testdata/golden-conversation-profile-v2.json"
+        ))
+        .unwrap();
+        let mut profile: ConversationProfileV2 =
+            serde_json::from_value(vector["profile"].clone()).unwrap();
+        profile.protocol_versions = (1..=65).collect();
+        assert!(validate_profile(&profile).is_err());
+
+        profile.protocol_versions = vec![PROTOCOL_VERSION];
+        profile.interfaces = vec![ConversationInterface::Https {
+            url: format!("https://example.test/{}", "x".repeat(2_049)),
+        }];
+        assert!(validate_profile(&profile).is_err());
+    }
 
     #[test]
     fn generated_identity_drives_profile_and_tls_configuration() {

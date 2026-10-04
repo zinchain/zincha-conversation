@@ -11,6 +11,8 @@ use crate::{
     model::PrivacyMode,
 };
 
+const MAX_HTTPS_INTERFACE_URL_LENGTH: usize = 2_048;
+
 fn default_listen() -> SocketAddr {
     "127.0.0.1:9988".parse().expect("literal socket")
 }
@@ -265,6 +267,11 @@ impl Config {
         for interface in &self.service.interfaces {
             let identity = match interface {
                 ServiceInterfaceConfig::Https { url } => {
+                    if url.len() > MAX_HTTPS_INTERFACE_URL_LENGTH {
+                        return Err(Error::Invalid(
+                            "HTTPS interface URL exceeds the supported length".to_string(),
+                        ));
+                    }
                     let parsed = url::Url::parse(url).map_err(|_| {
                         Error::Invalid("HTTPS interface URL is invalid".to_string())
                     })?;
@@ -550,6 +557,12 @@ mod tests {
         let mut insecure_origin = example();
         insecure_origin.service.allowed_origins = vec!["http://marketplace.example".into()];
         assert!(insecure_origin.validate().is_err());
+
+        let mut oversized_https = example();
+        oversized_https.service.interfaces = vec![ServiceInterfaceConfig::Https {
+            url: format!("https://marketplace.example/{}", "x".repeat(2_049)),
+        }];
+        assert!(oversized_https.validate().is_err());
 
         let mut origin_with_path = example();
         origin_with_path.service.allowed_origins = vec!["https://marketplace.example/app".into()];

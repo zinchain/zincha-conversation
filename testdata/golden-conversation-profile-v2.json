@@ -1,0 +1,37 @@
+{
+  "profile": {
+    "version": 2,
+    "service_id": "provider-agent/conversations",
+    "interfaces": [
+      {
+        "type": "zincha_tls_v1",
+        "host": "203.0.113.25",
+        "port": 443,
+        "certificate_pins": [
+          {
+            "sha256": "abababababababababababababababababababababababababababababababab",
+            "not_before_ms": 1791000000000,
+            "not_after_ms": 1822536000000
+          },
+          {
+            "sha256": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+            "not_before_ms": 1822535700000,
+            "not_after_ms": 1854072000000
+          }
+        ]
+      },
+      {
+        "type": "https",
+        "url": "https://conversations.provider.example"
+      }
+    ],
+    "privacy_modes": [
+      "platform_readable",
+      "end_to_end"
+    ],
+    "protocol_versions": [
+      1
+    ]
+  },
+  "canonical_json": "{\"interfaces\":[{\"certificate_pins\":[{\"not_after_ms\":1822536000000,\"not_before_ms\":1791000000000,\"sha256\":\"abababababababababababababababababababababababababababababababab\"},{\"not_after_ms\":1854072000000,\"not_before_ms\":1822535700000,\"sha256\":\"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd\"}],\"host\":\"203.0.113.25\",\"port\":443,\"type\":\"zincha_tls_v1\"},{\"type\":\"https\",\"url\":\"https://conversations.provider.example\"}],\"privacy_modes\":[\"platform_readable\",\"end_to_end\"],\"protocol_versions\":[1],\"service_id\":\"provider-agent/conversations\",\"version\":2}"
+}
