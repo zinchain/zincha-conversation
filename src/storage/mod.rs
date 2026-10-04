@@ -6,7 +6,7 @@ use sqlx::{
     sqlite::{
         SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow, SqliteSynchronous,
     },
-    Acquire, Executor, PgPool, Postgres, Row, SqlitePool,
+    Executor, PgPool, Postgres, Row, SqlitePool,
 };
 use uuid::Uuid;
 
@@ -724,9 +724,9 @@ impl MessageWriter {
     }
 
     /// Commits one bounded set of conversation-local batches with one durable
-    /// PostgreSQL commit. Each conversation runs inside a savepoint so a
-    /// missing or otherwise invalid conversation does not discard successful
-    /// independent groups in the same admission slice.
+    /// PostgreSQL statement. PostgreSQL locks all involved conversations in a
+    /// canonical order, assigns their sequences independently, and reports a
+    /// missing conversation as an isolated group error.
     pub async fn insert_message_groups(
         &mut self,
         groups: &[Vec<NewMessage>],
@@ -763,22 +763,109 @@ async fn insert_message_groups_postgres_on(
     connection: &mut sqlx::PgConnection,
     groups: &[Vec<NewMessage>],
 ) -> Result<Vec<Result<Vec<Result<InsertMessageOutcome>>>>> {
-    let mut transaction = connection.begin().await?;
-    let mut outcomes = Vec::with_capacity(groups.len());
+    let message_count = groups.iter().map(Vec::len).sum::<usize>();
+    if message_count == 0 || groups.iter().any(Vec::is_empty) {
+        return Err(Error::Internal(
+            "PostgreSQL message groups must be nonempty".to_string(),
+        ));
+    }
+
+    let mut conversation_ids = Vec::with_capacity(message_count);
+    let mut message_ids = Vec::with_capacity(message_count);
+    let mut accepted_at_ms = Vec::with_capacity(message_count);
+    let mut senders = Vec::with_capacity(message_count);
+    let mut client_timestamp_ms = Vec::with_capacity(message_count);
+    let mut reply_to = Vec::with_capacity(message_count);
+    let mut key_epoch = Vec::with_capacity(message_count);
+    let mut payload_blobs = Vec::with_capacity(message_count);
+    let mut payload_digests = Vec::with_capacity(message_count);
+    let mut signing_key_ids = Vec::with_capacity(message_count);
+    let mut signatures = Vec::with_capacity(message_count);
+    let mut group_ranges = Vec::with_capacity(groups.len());
     for messages in groups {
-        let mut savepoint = transaction.begin().await?;
-        match insert_messages_postgres_on(&mut *savepoint, messages).await {
-            Ok(group_outcomes) => {
-                savepoint.commit().await?;
-                outcomes.push(Ok(group_outcomes));
+        let group_start = conversation_ids.len();
+        let conversation_id = &messages[0].conversation_id;
+        if messages
+            .iter()
+            .any(|message| message.conversation_id != *conversation_id)
+        {
+            return Err(Error::Internal(
+                "a PostgreSQL message group crossed conversation boundaries".to_string(),
+            ));
+        }
+        for message in messages {
+            conversation_ids.push(message.conversation_id.clone());
+            message_ids.push(message.message_id.to_string());
+            accepted_at_ms.push(message.accepted_at_ms);
+            senders.push(message.sender.clone());
+            client_timestamp_ms.push(message.client_timestamp_ms);
+            reply_to.push(message.reply_to.map(|id| id.to_string()));
+            key_epoch.push(message.key_epoch);
+            payload_blobs.push(message.payload_blob.clone());
+            payload_digests.push(message.payload_digest.clone());
+            signing_key_ids.push(message.signing_key_id.clone());
+            signatures.push(message.signature.clone());
+        }
+        group_ranges.push(group_start..conversation_ids.len());
+    }
+
+    let rows = sqlx::query(
+        "SELECT * FROM zincha_insert_message_groups_v2($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+    )
+    .bind(conversation_ids)
+    .bind(message_ids)
+    .bind(accepted_at_ms)
+    .bind(senders)
+    .bind(client_timestamp_ms)
+    .bind(reply_to)
+    .bind(key_epoch)
+    .bind(payload_blobs)
+    .bind(payload_digests)
+    .bind(signing_key_ids)
+    .bind(signatures)
+    .fetch_all(&mut *connection)
+    .await?;
+    if rows.len() != message_count {
+        return Err(Error::Internal(
+            "PostgreSQL returned an incomplete multi-conversation batch".to_string(),
+        ));
+    }
+
+    let mut flat_outcomes = Vec::with_capacity(message_count);
+    for (position, (row, message)) in rows.into_iter().zip(groups.iter().flatten()).enumerate() {
+        let input_index: i32 = row.try_get("input_index")?;
+        if input_index != (position + 1) as i32 {
+            return Err(Error::Internal(
+                "PostgreSQL returned a reordered multi-conversation batch".to_string(),
+            ));
+        }
+        let conversation_found: bool = row.try_get("conversation_found")?;
+        if !conversation_found {
+            flat_outcomes.push(None);
+            continue;
+        }
+        let inserted: bool = row.try_get("was_inserted")?;
+        let stored = message_from_postgres(&message.conversation_id, &row)?;
+        flat_outcomes.push(Some(validate_idempotent(&stored, message).map(|()| {
+            if inserted {
+                InsertMessageOutcome::Inserted(stored)
+            } else {
+                InsertMessageOutcome::Existing(stored)
             }
-            Err(error) => {
-                savepoint.rollback().await?;
-                outcomes.push(Err(error));
-            }
+        })));
+    }
+
+    let mut outcomes = Vec::with_capacity(groups.len());
+    for range in group_ranges {
+        if flat_outcomes[range.clone()].iter().any(Option::is_none) {
+            outcomes.push(Err(Error::NotFound("conversation not found".to_string())));
+        } else {
+            outcomes.push(Ok(flat_outcomes[range]
+                .iter_mut()
+                .map(|outcome| outcome.take().expect("valid conversation outcome"))
+                .collect()));
         }
     }
-    transaction.commit().await?;
     Ok(outcomes)
 }
 

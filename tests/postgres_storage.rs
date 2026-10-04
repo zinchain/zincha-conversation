@@ -318,6 +318,43 @@ async fn postgres_atomic_session_and_concurrent_message_retry() {
         InsertMessageOutcome::Existing(_) => panic!("the second group was treated as a retry"),
     }
 
+    // Independent writers deliberately submit the same two conversations in
+    // opposite orders. The multi-conversation function must acquire its locks
+    // canonically and preserve both independent sequence streams.
+    let concurrent_group_sets = vec![
+        vec![
+            vec![grouped_message(&conversation_id, b"forward first")],
+            vec![grouped_message(&second_conversation_id, b"forward second")],
+        ],
+        vec![
+            vec![grouped_message(&second_conversation_id, b"reverse second")],
+            vec![grouped_message(&conversation_id, b"reverse first")],
+        ],
+    ];
+    let mut concurrent_group_writers = Vec::new();
+    for groups in concurrent_group_sets {
+        let database = database.clone();
+        concurrent_group_writers.push(tokio::spawn(async move {
+            database
+                .message_writer()
+                .await
+                .unwrap()
+                .insert_message_groups(&groups)
+                .await
+                .unwrap()
+        }));
+    }
+    for writer in concurrent_group_writers {
+        for group in writer.await.unwrap() {
+            for outcome in group.unwrap() {
+                assert!(matches!(
+                    outcome.unwrap(),
+                    InsertMessageOutcome::Inserted(_)
+                ));
+            }
+        }
+    }
+
     if let Database::Postgres(pool) = database {
         let (message_count, event_count, next_sequence): (i64, i64, i64) = sqlx::query_as(
             "SELECT
@@ -329,7 +366,7 @@ async fn postgres_atomic_session_and_concurrent_message_retry() {
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!((message_count, event_count, next_sequence), (99, 99, 100));
+        assert_eq!((message_count, event_count, next_sequence), (101, 101, 102));
         let mismatched_events: i64 = sqlx::query_scalar(
             "SELECT COUNT(*)
                FROM conversation_events AS event
@@ -354,7 +391,7 @@ async fn postgres_atomic_session_and_concurrent_message_retry() {
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(second_counts, (1, 1, 2));
+        assert_eq!(second_counts, (3, 3, 4));
         sqlx::query("DELETE FROM conversations WHERE id = $1")
             .bind(&second_conversation_id)
             .execute(&pool)
