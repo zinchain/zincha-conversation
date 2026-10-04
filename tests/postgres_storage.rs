@@ -293,8 +293,9 @@ async fn postgres_atomic_session_and_concurrent_message_retry() {
         signing_key_id: delegation.delegation_id.to_string(),
         signature: "99".repeat(64),
     };
+    let first_group_message = grouped_message(&conversation_id, b"first group");
     let grouped_messages = vec![
-        vec![grouped_message(&conversation_id, b"first group")],
+        vec![first_group_message.clone(), first_group_message],
         vec![grouped_message(&"f".repeat(64), b"missing group")],
         vec![grouped_message(&second_conversation_id, b"second group")],
     ];
@@ -303,9 +304,14 @@ async fn postgres_atomic_session_and_concurrent_message_retry() {
         .await
         .unwrap()
         .into_iter();
-    match grouped.next().unwrap().unwrap()[0].as_ref().unwrap() {
+    let first_group = grouped.next().unwrap().unwrap();
+    match first_group[0].as_ref().unwrap() {
         InsertMessageOutcome::Inserted(row) => assert_eq!(row.sequence, 99),
         InsertMessageOutcome::Existing(_) => panic!("the first group was treated as a retry"),
+    }
+    match first_group[1].as_ref().unwrap() {
+        InsertMessageOutcome::Existing(row) => assert_eq!(row.sequence, 99),
+        InsertMessageOutcome::Inserted(_) => panic!("an in-slice retry was inserted twice"),
     }
     assert!(grouped
         .next()

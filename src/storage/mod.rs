@@ -1,4 +1,4 @@
-use std::str::FromStr;
+use std::{collections::HashMap, str::FromStr};
 
 use sqlx::{
     pool::PoolConnection,
@@ -770,20 +770,10 @@ async fn insert_message_groups_postgres_on(
         ));
     }
 
-    let mut conversation_ids = Vec::with_capacity(message_count);
-    let mut message_ids = Vec::with_capacity(message_count);
-    let mut accepted_at_ms = Vec::with_capacity(message_count);
-    let mut senders = Vec::with_capacity(message_count);
-    let mut client_timestamp_ms = Vec::with_capacity(message_count);
-    let mut reply_to = Vec::with_capacity(message_count);
-    let mut key_epoch = Vec::with_capacity(message_count);
-    let mut payload_blobs = Vec::with_capacity(message_count);
-    let mut payload_digests = Vec::with_capacity(message_count);
-    let mut signing_key_ids = Vec::with_capacity(message_count);
-    let mut signatures = Vec::with_capacity(message_count);
+    let mut flat_messages = Vec::with_capacity(message_count);
     let mut group_ranges = Vec::with_capacity(groups.len());
     for messages in groups {
-        let group_start = conversation_ids.len();
+        let group_start = flat_messages.len();
         let conversation_id = &messages[0].conversation_id;
         if messages
             .iter()
@@ -793,21 +783,76 @@ async fn insert_message_groups_postgres_on(
                 "a PostgreSQL message group crossed conversation boundaries".to_string(),
             ));
         }
-        for message in messages {
-            conversation_ids.push(message.conversation_id.clone());
-            message_ids.push(message.message_id.to_string());
-            accepted_at_ms.push(message.accepted_at_ms);
-            senders.push(message.sender.clone());
-            client_timestamp_ms.push(message.client_timestamp_ms);
-            reply_to.push(message.reply_to.map(|id| id.to_string()));
-            key_epoch.push(message.key_epoch);
-            payload_blobs.push(message.payload_blob.clone());
-            payload_digests.push(message.payload_digest.clone());
-            signing_key_ids.push(message.signing_key_id.clone());
-            signatures.push(message.signature.clone());
-        }
-        group_ranges.push(group_start..conversation_ids.len());
+        flat_messages.extend(messages);
+        group_ranges.push(group_start..flat_messages.len());
     }
+
+    // Admission slices are bounded (16 by default, 256 maximum). Deduplicate
+    // their routing keys here so PostgreSQL can use one exact index probe per
+    // unique message without sorting or hashing the common all-new path.
+    let mut unique_by_key = HashMap::with_capacity(message_count);
+    let mut unique_messages = Vec::with_capacity(message_count);
+    let mut unique_first_positions = Vec::with_capacity(message_count);
+    let mut input_unique_indexes = Vec::with_capacity(message_count);
+    for (position, message) in flat_messages.iter().enumerate() {
+        let key = (message.conversation_id.clone(), message.message_id);
+        let unique_index = match unique_by_key.get(&key) {
+            Some(index) => *index,
+            None => {
+                let index = unique_messages.len();
+                unique_by_key.insert(key, index);
+                unique_messages.push(*message);
+                unique_first_positions.push(position);
+                index
+            }
+        };
+        input_unique_indexes.push(unique_index);
+    }
+
+    let conversation_ids = unique_messages
+        .iter()
+        .map(|message| message.conversation_id.clone())
+        .collect::<Vec<_>>();
+    let message_ids = unique_messages
+        .iter()
+        .map(|message| message.message_id.to_string())
+        .collect::<Vec<_>>();
+    let accepted_at_ms = unique_messages
+        .iter()
+        .map(|message| message.accepted_at_ms)
+        .collect::<Vec<_>>();
+    let senders = unique_messages
+        .iter()
+        .map(|message| message.sender.clone())
+        .collect::<Vec<_>>();
+    let client_timestamp_ms = unique_messages
+        .iter()
+        .map(|message| message.client_timestamp_ms)
+        .collect::<Vec<_>>();
+    let reply_to = unique_messages
+        .iter()
+        .map(|message| message.reply_to.map(|id| id.to_string()))
+        .collect::<Vec<_>>();
+    let key_epoch = unique_messages
+        .iter()
+        .map(|message| message.key_epoch)
+        .collect::<Vec<_>>();
+    let payload_blobs = unique_messages
+        .iter()
+        .map(|message| message.payload_blob.clone())
+        .collect::<Vec<_>>();
+    let payload_digests = unique_messages
+        .iter()
+        .map(|message| message.payload_digest.clone())
+        .collect::<Vec<_>>();
+    let signing_key_ids = unique_messages
+        .iter()
+        .map(|message| message.signing_key_id.clone())
+        .collect::<Vec<_>>();
+    let signatures = unique_messages
+        .iter()
+        .map(|message| message.signature.clone())
+        .collect::<Vec<_>>();
 
     let rows = sqlx::query(
         "SELECT * FROM zincha_insert_message_groups_v2($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
@@ -825,14 +870,14 @@ async fn insert_message_groups_postgres_on(
     .bind(signatures)
     .fetch_all(&mut *connection)
     .await?;
-    if rows.len() != message_count {
+    if rows.len() != unique_messages.len() {
         return Err(Error::Internal(
             "PostgreSQL returned an incomplete multi-conversation batch".to_string(),
         ));
     }
 
-    let mut flat_outcomes = Vec::with_capacity(message_count);
-    for (position, (row, message)) in rows.into_iter().zip(groups.iter().flatten()).enumerate() {
+    let mut unique_outcomes = Vec::with_capacity(unique_messages.len());
+    for (position, (row, message)) in rows.into_iter().zip(&unique_messages).enumerate() {
         let input_index: i32 = row.try_get("input_index")?;
         if input_index != (position + 1) as i32 {
             return Err(Error::Internal(
@@ -841,16 +886,31 @@ async fn insert_message_groups_postgres_on(
         }
         let conversation_found: bool = row.try_get("conversation_found")?;
         if !conversation_found {
-            flat_outcomes.push(None);
+            unique_outcomes.push(None);
             continue;
         }
         let inserted: bool = row.try_get("was_inserted")?;
-        let stored = message_from_postgres(&message.conversation_id, &row)?;
-        flat_outcomes.push(Some(validate_idempotent(&stored, message).map(|()| {
-            if inserted {
-                InsertMessageOutcome::Inserted(stored)
+        let stored = if inserted {
+            new_to_stored(message, row.try_get("sequence")?)
+        } else {
+            message_from_postgres(&message.conversation_id, &row)?
+        };
+        unique_outcomes.push(Some((inserted, stored)));
+    }
+
+    let mut flat_outcomes = Vec::with_capacity(message_count);
+    for (position, (message, unique_index)) in
+        flat_messages.iter().zip(input_unique_indexes).enumerate()
+    {
+        let Some((inserted, stored)) = &unique_outcomes[unique_index] else {
+            flat_outcomes.push(None);
+            continue;
+        };
+        flat_outcomes.push(Some(validate_idempotent(stored, message).map(|()| {
+            if *inserted && unique_first_positions[unique_index] == position {
+                InsertMessageOutcome::Inserted(stored.clone())
             } else {
-                InsertMessageOutcome::Existing(stored)
+                InsertMessageOutcome::Existing(stored.clone())
             }
         })));
     }

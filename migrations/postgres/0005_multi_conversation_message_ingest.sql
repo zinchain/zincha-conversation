@@ -118,39 +118,26 @@ BEGIN
             ON requested.conversation_id = conversation.id
          ORDER BY conversation.id
     ),
-    ranked_input AS MATERIALIZED (
-        SELECT input.*,
-               row_number() OVER (
-                   PARTITION BY input.conversation_id, input.message_id
-                   ORDER BY input.input_index
-               ) AS message_occurrence
-          FROM input
-    ),
     existing_messages AS MATERIALIZED (
         SELECT message.*
-          FROM (
-                   SELECT DISTINCT candidate.conversation_id,
-                                   candidate.message_id
-                     FROM ranked_input AS candidate
-               ) AS requested
+          FROM input AS requested
           JOIN messages AS message
             ON message.conversation_id = requested.conversation_id
            AND message.message_id = requested.message_id
     ),
     new_candidates AS MATERIALIZED (
-        SELECT ranked.*,
+        SELECT candidate.*,
                row_number() OVER (
-                   PARTITION BY ranked.conversation_id
-                   ORDER BY ranked.input_index
+                   PARTITION BY candidate.conversation_id
+                   ORDER BY candidate.input_index
                ) - 1 AS sequence_offset
-          FROM ranked_input AS ranked
+          FROM input AS candidate
           JOIN locked_conversations AS locked
-            ON locked.id = ranked.conversation_id
+            ON locked.id = candidate.conversation_id
           LEFT JOIN existing_messages AS existing
-            ON existing.conversation_id = ranked.conversation_id
-           AND existing.message_id = ranked.message_id
-         WHERE ranked.message_occurrence = 1
-           AND existing.message_id IS NULL
+            ON existing.conversation_id = candidate.conversation_id
+           AND existing.message_id = candidate.message_id
+         WHERE existing.message_id IS NULL
     ),
     insertion_stats AS MATERIALIZED (
         SELECT candidate.conversation_id,
@@ -226,41 +213,30 @@ BEGIN
           FROM inserted_messages AS message
          ORDER BY message.conversation_id, message.sequence
         RETURNING conversation_events.conversation_id
-    ),
-    resolved_messages AS MATERIALIZED (
-        SELECT existing.*, FALSE AS was_inserted
-          FROM existing_messages AS existing
-        UNION ALL
-        SELECT inserted.*, TRUE AS was_inserted
-          FROM inserted_messages AS inserted
     )
     SELECT input.input_index,
            locked.id IS NOT NULL AS conversation_found,
-           COALESCE(
-               resolved.was_inserted
-               AND candidate.input_index = input.input_index,
-               FALSE
-           ) AS was_inserted,
-           resolved.sequence,
-           resolved.message_id,
-           resolved.sender,
-           resolved.client_timestamp_ms,
-           resolved.accepted_at_ms,
-           resolved.reply_to,
-           resolved.key_epoch,
-           resolved.payload_blob,
-           resolved.payload_digest,
-           resolved.signing_key_id,
-           resolved.signature
+           inserted.message_id IS NOT NULL AS was_inserted,
+           COALESCE(inserted.sequence, existing.sequence) AS sequence,
+           existing.message_id,
+           existing.sender,
+           existing.client_timestamp_ms,
+           existing.accepted_at_ms,
+           existing.reply_to,
+           existing.key_epoch,
+           existing.payload_blob,
+           existing.payload_digest,
+           existing.signing_key_id,
+           existing.signature
       FROM input
       LEFT JOIN locked_conversations AS locked
         ON locked.id = input.conversation_id
-      LEFT JOIN resolved_messages AS resolved
-        ON resolved.conversation_id = input.conversation_id
-       AND resolved.message_id = input.message_id
-      LEFT JOIN new_candidates AS candidate
-        ON candidate.conversation_id = input.conversation_id
-       AND candidate.message_id = input.message_id
+      LEFT JOIN existing_messages AS existing
+        ON existing.conversation_id = input.conversation_id
+       AND existing.message_id = input.message_id
+      LEFT JOIN inserted_messages AS inserted
+        ON inserted.conversation_id = input.conversation_id
+       AND inserted.message_id = input.message_id
      -- Reference the event CTE so message acceptance cannot finish without its
      -- matching durable event insert.
      LEFT JOIN (SELECT count(*) AS inserted_event_count FROM inserted_events) AS event_barrier
