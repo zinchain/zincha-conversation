@@ -56,7 +56,7 @@ fn default_message_batch_max() -> usize {
     16
 }
 fn default_message_batch_linger_micros() -> u64 {
-    2_000
+    8_000
 }
 fn default_message_clock_skew() -> u64 {
     10 * 60
@@ -631,6 +631,7 @@ backups_secs = 1
             ServiceInterfaceConfig::ZinchaTlsV1 { port, .. } => assert_eq!(*port, 443),
             _ => panic!("expected direct TLS interface"),
         }
+        assert_eq!(parsed.limits.message_batch_linger_micros, 8_000);
         parsed.validate().unwrap();
 
         let mut noncanonical = parsed;

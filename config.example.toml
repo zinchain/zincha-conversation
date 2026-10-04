@@ -69,7 +69,7 @@ max_inflight_messages = 256
 # PostgreSQL amortizes one-conversation sequence locking and WAL commit across
 # a bounded micro-batch. SQLite remains a direct single-process write path.
 message_batch_max_messages = 16
-message_batch_linger_micros = 2000
+message_batch_linger_micros = 8000
 sse_buffer_messages = 256
 max_sse_connections = 10000
 # Caps simultaneous database replay/catch-up work independently of idle streams.
