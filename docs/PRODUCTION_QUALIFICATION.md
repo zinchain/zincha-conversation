@@ -47,7 +47,8 @@ Run the correctness matrix independently through Web-PKI HTTPS and
 `zincha-tls-v1`, then with mixed API/SSE traffic. Verify TLS 1.2, plaintext,
 early data, malformed/expired/future/removed pins, wrong service IDs, and stale
 live profiles fail before credentials or workflow identifiers are sent. Run
-the old-only, overlap, new-active, and old-removed certificate-rotation phases.
+the old-only, overlap with the old certificate active, overlap with the new
+certificate active, new-only, and old-certificate-rejected rotation phases.
 
 ## Message-throughput gate
 
