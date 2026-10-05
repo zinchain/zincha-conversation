@@ -183,6 +183,7 @@ impl ChainClient {
         let rpc_url = Url::parse(&config.rpc_url)
             .map_err(|error| Error::Invalid(format!("invalid chain RPC URL: {error}")))?;
         let client = reqwest::Client::builder()
+            .user_agent(concat!("zincha-conversation/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(std::time::Duration::from_secs(5))
             .timeout(std::time::Duration::from_secs(15))
             .pool_max_idle_per_host(8)
