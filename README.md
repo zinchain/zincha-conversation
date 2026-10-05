@@ -122,6 +122,9 @@ See [`openapi.yaml`](openapi.yaml) for the HTTP contract. The Rust, TypeScript, 
   provider.
 - Backups must include the database and the exact master-key version. Test restoration before reducing backup retention.
 - Set retention values deliberately. The process refuses zero values.
+- Keep `authorization_max_staleness_secs` at or below the enforced 60-second
+  ceiling. Lifecycle workers invalidate revoked and expired grants immediately;
+  this ceiling bounds stale authorization if a worker or node query is unavailable.
 - Rotate operational conversation delegations rather than long-lived account
   keys. Revocation invalidates all sessions backed by that delegation
   immediately. Rotate the service chain-read key by exposing a next key,

@@ -1,5 +1,5 @@
 use std::{
-    collections::{hash_map::RandomState, HashMap},
+    collections::{hash_map::RandomState, HashMap, HashSet},
     future::Future,
     hash::BuildHasher,
     io,
@@ -90,6 +90,53 @@ enum MessageIngest {
 struct PendingMessage {
     message: NewMessage,
     response: oneshot::Sender<Result<InsertMessageOutcome>>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct DelegationLifecycleObservation {
+    sequence: i64,
+    invalidated_delegator: Option<String>,
+}
+
+fn parse_delegation_lifecycle_observation(
+    item: &serde_json::Value,
+) -> Result<DelegationLifecycleObservation> {
+    let sequence = item
+        .get("seq")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| Error::Unavailable("delegation lifecycle sequence is missing".into()))?;
+    let event = item
+        .get("event")
+        .and_then(|event| event.get("RpcReadDelegationLifecycle"))
+        .ok_or_else(|| {
+            Error::Unavailable("delegation lifecycle payload has an unexpected shape".into())
+        })?;
+    let action = event
+        .get("action")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| Error::Unavailable("delegation lifecycle action is missing".into()))?;
+    let invalidated_delegator = match action {
+        "granted" | "renewed" => None,
+        "revoked" | "expired" => Some(
+            event
+                .get("delegator")
+                .and_then(serde_json::Value::as_str)
+                .filter(|delegator| !delegator.is_empty())
+                .ok_or_else(|| {
+                    Error::Unavailable("delegation lifecycle invalidation has no delegator".into())
+                })?
+                .to_string(),
+        ),
+        _ => {
+            return Err(Error::Unavailable(format!(
+                "unsupported delegation lifecycle action {action}"
+            )))
+        }
+    };
+    Ok(DelegationLifecycleObservation {
+        sequence,
+        invalidated_delegator,
+    })
 }
 
 impl MessageIngest {
@@ -931,8 +978,13 @@ impl ConversationService {
             return Err(Error::Forbidden("tenant mismatch".to_string()));
         }
         let current = now_ms();
-        let max_staleness =
-            (self.config.limits.authorization_max_staleness_secs as i64).saturating_mul(1_000);
+        let max_staleness = (self
+            .config
+            .limits
+            .authorization_max_staleness_secs
+            .min(crate::config::MAX_AUTHORIZATION_STALENESS_SECS)
+            as i64)
+            .saturating_mul(1_000);
         if current.saturating_sub(conversation.snapshot.observed_at_ms) >= max_staleness {
             conversation = self
                 .refresh_conversation_singleflight(conversation_id, max_staleness)
@@ -1445,35 +1497,43 @@ impl ConversationService {
                             }
                         };
                         let mut next_cursor = cursor;
+                        let mut invalidated_delegators = HashSet::new();
+                        let mut page_valid = true;
                         if let Some(items) = page.get("items").and_then(serde_json::Value::as_array)
                         {
                             for item in items {
-                                let Some(sequence) =
-                                    item.get("seq").and_then(serde_json::Value::as_i64)
-                                else {
-                                    continue;
-                                };
-                                next_cursor = next_cursor.max(sequence);
-                                let Some(event) = item.get("event") else {
-                                    continue;
-                                };
-                                let action = event
-                                    .get("action")
-                                    .and_then(serde_json::Value::as_str)
-                                    .unwrap_or_default();
-                                if matches!(action, "revoked" | "expired") {
-                                    if let Some(delegator) =
-                                        event.get("delegator").and_then(serde_json::Value::as_str)
-                                    {
-                                        if let Err(error) =
-                                            db.invalidate_provider_authorization(delegator).await
-                                        {
-                                            tracing::warn!(%error, %delegator, "invalidate delegated authorization cache failed");
-                                            break;
+                                match parse_delegation_lifecycle_observation(item) {
+                                    Ok(observation) => {
+                                        next_cursor = next_cursor.max(observation.sequence);
+                                        if let Some(delegator) = observation.invalidated_delegator {
+                                            invalidated_delegators.insert(delegator);
                                         }
+                                    }
+                                    Err(error) => {
+                                        tracing::warn!(%error, %delegate, "invalid delegation lifecycle response");
+                                        page_valid = false;
+                                        break;
                                     }
                                 }
                             }
+                        } else {
+                            tracing::warn!(%delegate, "delegation lifecycle response has no items array");
+                            page_valid = false;
+                        }
+                        if !page_valid {
+                            break;
+                        }
+                        for delegator in &invalidated_delegators {
+                            if let Err(error) =
+                                db.invalidate_provider_authorization(delegator).await
+                            {
+                                tracing::warn!(%error, %delegator, "invalidate delegated authorization cache failed");
+                                page_valid = false;
+                                break;
+                            }
+                        }
+                        if !page_valid {
+                            break;
                         }
                         if next_cursor > previous_cursor {
                             if let Err(error) = db
@@ -1760,6 +1820,63 @@ fn payload_aad(conversation_id: &str, message_id: Uuid, digest: &str) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delegation_lifecycle_parser_matches_node_envelope_and_fails_closed() {
+        let revoked = serde_json::json!({
+            "seq": 17,
+            "emitted_at_ms": 1_700_000_000_000_i64,
+            "event": {
+                "RpcReadDelegationLifecycle": {
+                    "block_number": 12,
+                    "delegation_id": "11".repeat(32),
+                    "action": "revoked",
+                    "delegator": "zn100112233445566778899aabbccddeeff00112233",
+                    "delegate": "zn1ffeeddccbbaa99887766554433221100ffeeddcc",
+                    "service_id": "provider-agent/conversations",
+                    "scope_mask": 255,
+                    "expires_at_ms": 1_800_000_000_000_u64
+                }
+            }
+        });
+        assert_eq!(
+            parse_delegation_lifecycle_observation(&revoked).unwrap(),
+            DelegationLifecycleObservation {
+                sequence: 17,
+                invalidated_delegator: Some(
+                    "zn100112233445566778899aabbccddeeff00112233".to_string()
+                ),
+            }
+        );
+
+        let renewed = serde_json::json!({
+            "seq": 18,
+            "event": {
+                "RpcReadDelegationLifecycle": {
+                    "action": "renewed",
+                    "delegator": "zn100112233445566778899aabbccddeeff00112233"
+                }
+            }
+        });
+        assert_eq!(
+            parse_delegation_lifecycle_observation(&renewed).unwrap(),
+            DelegationLifecycleObservation {
+                sequence: 18,
+                invalidated_delegator: None,
+            }
+        );
+
+        assert!(parse_delegation_lifecycle_observation(&serde_json::json!({
+            "seq": 19,
+            "event": {"action": "expired", "delegator": "provider"}
+        }))
+        .is_err());
+        assert!(parse_delegation_lifecycle_observation(&serde_json::json!({
+            "seq": 20,
+            "event": {"RpcReadDelegationLifecycle": {"action": "removed"}}
+        }))
+        .is_err());
+    }
 
     #[tokio::test]
     async fn direct_tls_enforces_protocol_and_connection_bounds() {

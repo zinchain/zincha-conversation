@@ -12,6 +12,7 @@ use crate::{
 };
 
 const MAX_HTTPS_INTERFACE_URL_LENGTH: usize = 2_048;
+pub(crate) const MAX_AUTHORIZATION_STALENESS_SECS: u64 = 60;
 
 fn default_listen() -> SocketAddr {
     "127.0.0.1:9988".parse().expect("literal socket")
@@ -483,7 +484,7 @@ impl Config {
         }
         if self.limits.challenge_ttl_secs > MAX_DURATION_SECS
             || self.limits.session_ttl_secs > MAX_DURATION_SECS
-            || self.limits.authorization_max_staleness_secs > MAX_DURATION_SECS
+            || self.limits.authorization_max_staleness_secs > MAX_AUTHORIZATION_STALENESS_SECS
             || self.limits.message_clock_skew_secs > MAX_DURATION_SECS
             || self.limits.terminal_write_grace_secs != 7 * 24 * 60 * 60
         {
@@ -670,6 +671,10 @@ backups_secs = 1
 
         let mut config = example();
         config.limits.terminal_write_grace_secs -= 1;
+        assert!(config.validate().is_err());
+
+        let mut config = example();
+        config.limits.authorization_max_staleness_secs = MAX_AUTHORIZATION_STALENESS_SECS + 1;
         assert!(config.validate().is_err());
     }
 

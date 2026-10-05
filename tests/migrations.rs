@@ -86,3 +86,51 @@ async fn sqlite_delegation_lifecycle_cursor_is_durable_and_monotonic() {
         7
     );
 }
+
+#[tokio::test]
+async fn sqlite_delegation_revocation_invalidates_only_matching_provider_snapshots() {
+    let temp = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        temp.path().join("invalidation.sqlite").display()
+    );
+    let database = Database::connect(&database_url, 1).await.unwrap();
+    database.migrate().await.unwrap();
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            SqliteConnectOptions::from_str(&database_url)
+                .unwrap()
+                .create_if_missing(false),
+        )
+        .await
+        .unwrap();
+    for (id, provider) in [("matching", "provider-a"), ("other", "provider-b")] {
+        sqlx::query("INSERT INTO conversations (id, tenant_id, subject_json, home_service_id, privacy_mode, snapshot_json, next_sequence, created_at_ms, updated_at_ms) VALUES (?, ?, ?, ?, ?, ?, 1, 1, 1)")
+            .bind(id)
+            .bind("tenant")
+            .bind(format!(r#"{{"kind":"task","id":"{id}"}}"#))
+            .bind("provider-agent/conversations")
+            .bind("platform_readable")
+            .bind(format!(r#"{{"provider":"{provider}","observed_at_ms":123}}"#))
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(
+        database
+            .invalidate_provider_authorization("provider-a")
+            .await
+            .unwrap(),
+        1
+    );
+    let rows = sqlx::query(
+        "SELECT id, json_extract(snapshot_json, '$.observed_at_ms') AS observed_at_ms FROM conversations ORDER BY id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows[0].try_get::<i64, _>("observed_at_ms").unwrap(), 0);
+    assert_eq!(rows[1].try_get::<i64, _>("observed_at_ms").unwrap(), 123);
+}

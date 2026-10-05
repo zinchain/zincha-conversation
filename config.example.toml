@@ -61,6 +61,8 @@ backups_secs = 7776000
 [limits]
 challenge_ttl_secs = 300
 session_ttl_secs = 900
+# Hard-capped at 60 seconds so a stalled lifecycle worker cannot extend
+# authorization after a chain-read grant is revoked or expires.
 authorization_max_staleness_secs = 60
 terminal_write_grace_secs = 604800
 max_request_body_bytes = 65536

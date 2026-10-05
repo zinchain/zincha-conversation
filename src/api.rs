@@ -274,7 +274,7 @@ async fn stream_events(
             .config
             .limits
             .authorization_max_staleness_secs
-            .max(1),
+            .clamp(1, crate::config::MAX_AUTHORIZATION_STALENESS_SECS),
     );
     let live = async_stream::stream! {
         let _sse_permit = sse_permit;
