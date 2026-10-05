@@ -105,21 +105,19 @@ fn parse_delegation_lifecycle_observation(
         .get("seq")
         .and_then(serde_json::Value::as_i64)
         .ok_or_else(|| Error::Unavailable("delegation lifecycle sequence is missing".into()))?;
-    let event = item
-        .get("event")
-        .and_then(|event| event.get("RpcReadDelegationLifecycle"))
-        .ok_or_else(|| {
-            Error::Unavailable("delegation lifecycle payload has an unexpected shape".into())
-        })?;
-    let action = event
+    if item.get("type").and_then(serde_json::Value::as_str) != Some("RpcReadDelegationLifecycle") {
+        return Err(Error::Unavailable(
+            "delegation lifecycle payload has an unexpected shape".into(),
+        ));
+    }
+    let action = item
         .get("action")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| Error::Unavailable("delegation lifecycle action is missing".into()))?;
     let invalidated_delegator = match action {
         "granted" | "renewed" => None,
         "revoked" | "expired" => Some(
-            event
-                .get("delegator")
+            item.get("delegator")
                 .and_then(serde_json::Value::as_str)
                 .filter(|delegator| !delegator.is_empty())
                 .ok_or_else(|| {
@@ -1822,22 +1820,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn delegation_lifecycle_parser_matches_node_envelope_and_fails_closed() {
+    fn delegation_lifecycle_parser_matches_node_response_and_fails_closed() {
         let revoked = serde_json::json!({
             "seq": 17,
             "emitted_at_ms": 1_700_000_000_000_i64,
-            "event": {
-                "RpcReadDelegationLifecycle": {
-                    "block_number": 12,
-                    "delegation_id": "11".repeat(32),
-                    "action": "revoked",
-                    "delegator": "zn100112233445566778899aabbccddeeff00112233",
-                    "delegate": "zn1ffeeddccbbaa99887766554433221100ffeeddcc",
-                    "service_id": "provider-agent/conversations",
-                    "scope_mask": 255,
-                    "expires_at_ms": 1_800_000_000_000_u64
-                }
-            }
+            "type": "RpcReadDelegationLifecycle",
+            "block_number": 12,
+            "delegation_id": "11".repeat(32),
+            "action": "revoked",
+            "delegator": "zn100112233445566778899aabbccddeeff00112233",
+            "delegate": "zn1ffeeddccbbaa99887766554433221100ffeeddcc",
+            "service_id": "provider-agent/conversations",
+            "scope_mask": 255,
+            "expires_at_ms": 1_800_000_000_000_u64
         });
         assert_eq!(
             parse_delegation_lifecycle_observation(&revoked).unwrap(),
@@ -1851,12 +1846,9 @@ mod tests {
 
         let renewed = serde_json::json!({
             "seq": 18,
-            "event": {
-                "RpcReadDelegationLifecycle": {
-                    "action": "renewed",
-                    "delegator": "zn100112233445566778899aabbccddeeff00112233"
-                }
-            }
+            "type": "RpcReadDelegationLifecycle",
+            "action": "renewed",
+            "delegator": "zn100112233445566778899aabbccddeeff00112233"
         });
         assert_eq!(
             parse_delegation_lifecycle_observation(&renewed).unwrap(),
@@ -1868,12 +1860,15 @@ mod tests {
 
         assert!(parse_delegation_lifecycle_observation(&serde_json::json!({
             "seq": 19,
-            "event": {"action": "expired", "delegator": "provider"}
+            "type": "OtherLifecycle",
+            "action": "expired",
+            "delegator": "provider"
         }))
         .is_err());
         assert!(parse_delegation_lifecycle_observation(&serde_json::json!({
             "seq": 20,
-            "event": {"RpcReadDelegationLifecycle": {"action": "removed"}}
+            "type": "RpcReadDelegationLifecycle",
+            "action": "removed"
         }))
         .is_err());
     }
