@@ -2,7 +2,7 @@ use std::{io::Write, path::PathBuf};
 
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
-use zincha_conversation::{storage::Database, transport, Config, ConversationService};
+use zincha_conversation::{chain, storage::Database, transport, Config, ConversationService};
 
 #[derive(Parser)]
 #[command(name = "zincha-conversation", version, about)]
@@ -32,6 +32,10 @@ enum Command {
     Certificate {
         #[command(subcommand)]
         command: CertificateCommand,
+    },
+    ChainReadKey {
+        #[command(subcommand)]
+        command: ChainReadKeyCommand,
     },
 }
 
@@ -67,6 +71,15 @@ enum CertificateCommand {
         next_private_key: PathBuf,
         #[arg(long, default_value_t = 365)]
         valid_days: u32,
+    },
+}
+
+#[derive(Subcommand)]
+enum ChainReadKeyCommand {
+    /// Create a dedicated Ed25519 key for delegated chain reads.
+    Generate {
+        #[arg(long)]
+        secret_key: PathBuf,
     },
 }
 
@@ -134,6 +147,12 @@ async fn main() -> anyhow::Result<()> {
                     valid_days,
                 )?;
                 println!("{}", serde_json::to_string(&pin)?);
+            }
+        },
+        Command::ChainReadKey { command } => match command {
+            ChainReadKeyCommand::Generate { secret_key } => {
+                let info = chain::generate_chain_read_key(&secret_key)?;
+                println!("{}", serde_json::to_string(&info)?);
             }
         },
     }

@@ -117,6 +117,28 @@ pub struct ConversationProfileV2 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ChainReadKeyInfo {
+    pub public_key: String,
+    pub address: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConversationDelegationInfo {
+    pub protocol_version: u16,
+    pub service_id: String,
+    pub network: String,
+    pub chain_id: String,
+    pub active_key: ChainReadKeyInfo,
+    pub next_key: Option<ChainReadKeyInfo>,
+    pub required_scopes: Vec<String>,
+    pub required_scope_mask: u64,
+    pub default_grant_lifetime_ms: u64,
+    pub maximum_grant_lifetime_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConversationKeyDelegationV1 {
     pub version: u16,
     pub delegation_id: Uuid,

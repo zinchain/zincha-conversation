@@ -37,6 +37,17 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ProfileResponse" }
+  /v1/delegation-info:
+    get:
+      operationId: getConversationDelegationInfo
+      summary: On-chain grant parameters for this authenticated conversation service
+      responses:
+        "200":
+          description: Chain-read service key and required scopes
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DelegationInfoResponse" }
+        "503": { $ref: "#/components/responses/Error" }
   /v1/auth/challenges:
     post:
       operationId: createConversationChallenge
@@ -308,6 +319,43 @@ components:
         - type: object
           properties:
             data: { $ref: "#/components/schemas/ConversationProfile" }
+    ChainReadKey:
+      type: object
+      additionalProperties: false
+      required: [public_key, address]
+      properties:
+        public_key: { type: string, pattern: "^[0-9a-f]{64}$" }
+        address: { type: string, pattern: "^zn1[0-9a-f]{40}$" }
+    ConversationDelegationInfo:
+      type: object
+      additionalProperties: false
+      required: [protocol_version, service_id, network, chain_id, active_key, next_key, required_scopes, required_scope_mask, default_grant_lifetime_ms, maximum_grant_lifetime_ms]
+      properties:
+        protocol_version: { const: 1 }
+        service_id: { type: string, minLength: 1, maxLength: 256 }
+        network: { type: string, minLength: 1, maxLength: 64 }
+        chain_id: { type: string, minLength: 1, maxLength: 128 }
+        active_key: { $ref: "#/components/schemas/ChainReadKey" }
+        next_key:
+          oneOf:
+            - { $ref: "#/components/schemas/ChainReadKey" }
+            - { type: "null" }
+        required_scopes:
+          type: array
+          minItems: 1
+          maxItems: 8
+          uniqueItems: true
+          items:
+            enum: [task_read, task_lifecycle_read, agreement_read, agreement_lifecycle_read, tool_job_read, tool_job_lifecycle_read, tool_usage_session_read, tool_usage_session_lifecycle_read]
+        required_scope_mask: { type: integer, minimum: 1, maximum: 255 }
+        default_grant_lifetime_ms: { type: integer, format: int64, minimum: 3600000 }
+        maximum_grant_lifetime_ms: { type: integer, format: int64, minimum: 3600000 }
+    DelegationInfoResponse:
+      allOf:
+        - $ref: "#/components/schemas/SuccessEnvelope"
+        - type: object
+          properties:
+            data: { $ref: "#/components/schemas/ConversationDelegationInfo" }
     ChallengeRequest:
       type: object
       additionalProperties: false

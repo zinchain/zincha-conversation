@@ -19,6 +19,7 @@ fn openapi_is_valid_and_covers_the_public_router() {
         "/readyz",
         "/metrics",
         "/v1/profile",
+        "/v1/delegation-info",
         "/v1/auth/challenges",
         "/v1/auth/sessions",
         "/v1/auth/delegations/{delegation_id}",
@@ -77,6 +78,8 @@ fn openapi_is_valid_and_covers_the_public_router() {
         "HttpsConversationInterface",
         "ZinchaTlsV1ConversationInterface",
         "TlsCertificatePin",
+        "ChainReadKey",
+        "ConversationDelegationInfo",
     ] {
         assert_eq!(
             document["components"]["schemas"][strict_schema]["additionalProperties"].as_bool(),

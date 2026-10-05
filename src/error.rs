@@ -15,6 +15,10 @@ pub enum Error {
     Forbidden(String),
     #[error("resource not found: {0}")]
     NotFound(String),
+    #[error("chain-read delegation not found: {0}")]
+    DelegationNotFound(String),
+    #[error("chain-read delegation expired: {0}")]
+    DelegationExpired(String),
     #[error("conflict: {0}")]
     Conflict(String),
     #[error("dependency unavailable: {0}")]
@@ -47,6 +51,8 @@ impl IntoResponse for Error {
             Self::Authentication(_) => (StatusCode::UNAUTHORIZED, "authentication_failed"),
             Self::Forbidden(_) => (StatusCode::FORBIDDEN, "forbidden"),
             Self::NotFound(_) => (StatusCode::NOT_FOUND, "not_found"),
+            Self::DelegationNotFound(_) => (StatusCode::FORBIDDEN, "delegation_not_found"),
+            Self::DelegationExpired(_) => (StatusCode::FORBIDDEN, "delegation_expired"),
             Self::Conflict(_) => (StatusCode::CONFLICT, "conflict"),
             Self::Unavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
             Self::RateLimited(_) => (StatusCode::TOO_MANY_REQUESTS, "rate_limited"),

@@ -800,7 +800,7 @@ fn now_ms() -> i64 {
         .min(i64::MAX as u128) as i64
 }
 
-fn write_new_file(path: &Path, bytes: &[u8], private: bool) -> Result<()> {
+pub(crate) fn write_new_file(path: &Path, bytes: &[u8], private: bool) -> Result<()> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]

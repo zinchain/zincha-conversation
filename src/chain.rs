@@ -1,30 +1,36 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::{Arc, Mutex},
+};
 
 use async_trait::async_trait;
-use base64::{engine::general_purpose::STANDARD, Engine as _};
-use ed25519_dalek::{
-    pkcs8::DecodePrivateKey, Signature, Signer as _, SigningKey, Verifier as _, VerifyingKey,
-};
+use ed25519_dalek::{pkcs8::DecodePrivateKey, Signer as _, SigningKey};
 use futures_util::StreamExt;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use url::Url;
 
 use crate::{
-    config::{ChainConfig, ChainSignerConfig},
+    config::{ChainConfig, ChainReadStandbyKeyConfig},
     crypto::{
         address_from_public_key, now_ms, random_token, require_private_secret_file, sha256_hex,
     },
     error::{Error, Result},
-    model::{Participant, ParticipantRole, SubjectKind, SubjectRef, SubjectSnapshot},
+    model::{
+        ChainReadKeyInfo, ConversationDelegationInfo, Participant, ParticipantRole, SubjectKind,
+        SubjectRef, SubjectSnapshot,
+    },
 };
 
-const SIGNED_REQUEST_DOMAIN: &str = "zincha-rpc-signed-request-v1";
+const DELEGATED_REQUEST_DOMAIN: &str = "zincha-rpc-delegated-read-v1";
+const DELEGATION_ID_DOMAIN: &[u8] = b"zincha-rpc-read-delegation-id-v1";
+const REQUIRED_SCOPE_MASK: u64 = 0xff;
+const DEFAULT_GRANT_LIFETIME_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
+const MAX_GRANT_LIFETIME_MS: u64 = 90 * 24 * 60 * 60 * 1_000;
 const MAX_CHAIN_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
-const MAX_SIGNER_RESPONSE_BYTES: usize = 64 * 1024;
+const MAX_SELECTED_CHAIN_READ_KEYS: usize = 4_096;
 
 #[async_trait]
 pub trait RequestSigner: Send + Sync {
@@ -37,6 +43,33 @@ pub struct LocalRequestSigner {
     signing_key: SigningKey,
     address: String,
     public_key: String,
+}
+
+pub fn generate_chain_read_key(path: &std::path::Path) -> Result<ChainReadKeyInfo> {
+    if path.exists() {
+        return Err(Error::Invalid(format!(
+            "chain-read key generation refuses to overwrite {}",
+            path.display()
+        )));
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            Error::Invalid(format!(
+                "create chain-read key directory {}: {error}",
+                parent.display()
+            ))
+        })?;
+    }
+    let secret = crate::crypto::random_bytes::<32>();
+    let signer = SigningKey::from_bytes(&secret);
+    let public_key = signer.verifying_key().to_bytes();
+    let mut encoded = hex::encode(secret);
+    encoded.push('\n');
+    crate::transport::write_new_file(path, encoded.as_bytes(), true)?;
+    Ok(ChainReadKeyInfo {
+        public_key: hex::encode(public_key),
+        address: address_from_public_key(&public_key),
+    })
 }
 
 impl LocalRequestSigner {
@@ -81,177 +114,6 @@ impl RequestSigner for LocalRequestSigner {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct ExternalIdentity {
-    address: String,
-    public_key: String,
-}
-
-#[derive(Debug, Serialize)]
-struct ExternalSignRequest {
-    message_base64: String,
-    purpose: &'static str,
-}
-
-#[derive(Debug, Deserialize)]
-struct ExternalSignResponse {
-    signature: String,
-}
-
-pub struct ExternalRequestSigner {
-    client: reqwest::Client,
-    base_url: Url,
-    bearer: Option<String>,
-    address: String,
-    public_key: String,
-    verifying_key: VerifyingKey,
-}
-
-impl ExternalRequestSigner {
-    pub async fn connect(url: &str, bearer_token_file: Option<&std::path::Path>) -> Result<Self> {
-        let mut base_url = Url::parse(url)
-            .map_err(|error| Error::Invalid(format!("invalid external signer URL: {error}")))?;
-        let loopback = base_url.host_str().is_some_and(|host| {
-            host.eq_ignore_ascii_case("localhost")
-                || host
-                    .parse::<std::net::IpAddr>()
-                    .is_ok_and(|address| address.is_loopback())
-        });
-        if base_url.host_str().is_none()
-            || !base_url.username().is_empty()
-            || base_url.password().is_some()
-            || base_url.query().is_some()
-            || base_url.fragment().is_some()
-            || (base_url.scheme() != "https" && !(base_url.scheme() == "http" && loopback))
-        {
-            return Err(Error::Invalid(
-                "external signer URL must use HTTPS, except for loopback development".to_string(),
-            ));
-        }
-        if !base_url.path().ends_with('/') {
-            let path = format!("{}/", base_url.path());
-            base_url.set_path(&path);
-        }
-        let bearer = bearer_token_file
-            .map(|path| {
-                require_private_secret_file(path)?;
-                std::fs::read_to_string(path)
-                    .map(|value| value.trim().to_string())
-                    .map_err(|error| {
-                        Error::Invalid(format!(
-                            "read external signer token {}: {error}",
-                            path.display()
-                        ))
-                    })
-            })
-            .transpose()?;
-        if bearer
-            .as_ref()
-            .is_some_and(|token| token.is_empty() || token.len() > 8 * 1024)
-        {
-            return Err(Error::Invalid(
-                "external signer bearer token must be non-empty and at most 8 KiB".to_string(),
-            ));
-        }
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-            .map_err(|error| Error::Internal(format!("build signer client: {error}")))?;
-        let endpoint = base_url
-            .join("v1/identity")
-            .map_err(|error| Error::Invalid(format!("external signer identity URL: {error}")))?;
-        let mut request = client.get(endpoint);
-        if let Some(token) = bearer.as_deref() {
-            request = request.bearer_auth(token);
-        }
-        let response = request
-            .send()
-            .await
-            .map_err(|error| Error::Unavailable(format!("external signer identity: {error}")))?
-            .error_for_status()
-            .map_err(|error| Error::Unavailable(format!("external signer identity: {error}")))?;
-        let response: ExternalIdentity = decode_json_limited(
-            response,
-            MAX_SIGNER_RESPONSE_BYTES,
-            "external signer identity",
-        )
-        .await?;
-        let public: [u8; 32] = hex::decode(&response.public_key)
-            .map_err(|_| Error::Invalid("external signer public key is not hex".to_string()))?
-            .try_into()
-            .map_err(|_| {
-                Error::Invalid("external signer public key is not 32 bytes".to_string())
-            })?;
-        if address_from_public_key(&public) != response.address {
-            return Err(Error::Invalid(
-                "external signer address does not match its public key".to_string(),
-            ));
-        }
-        let verifying_key = VerifyingKey::from_bytes(&public).map_err(|_| {
-            Error::Invalid("external signer returned an invalid Ed25519 public key".to_string())
-        })?;
-        Ok(Self {
-            client,
-            base_url,
-            bearer,
-            address: response.address,
-            public_key: response.public_key,
-            verifying_key,
-        })
-    }
-}
-
-#[async_trait]
-impl RequestSigner for ExternalRequestSigner {
-    fn address(&self) -> &str {
-        &self.address
-    }
-
-    fn public_key_hex(&self) -> &str {
-        &self.public_key
-    }
-
-    async fn sign(&self, message: &[u8]) -> Result<String> {
-        let endpoint = self
-            .base_url
-            .join("v1/sign")
-            .map_err(|error| Error::Internal(format!("external signer URL: {error}")))?;
-        let mut request = self.client.post(endpoint).json(&ExternalSignRequest {
-            message_base64: STANDARD.encode(message),
-            purpose: "zincha-rpc-signed-request-v1",
-        });
-        if let Some(token) = self.bearer.as_deref() {
-            request = request.bearer_auth(token);
-        }
-        let response = request
-            .send()
-            .await
-            .map_err(|error| Error::Unavailable(format!("external signer: {error}")))?
-            .error_for_status()
-            .map_err(|error| Error::Unavailable(format!("external signer: {error}")))?;
-        let response: ExternalSignResponse = decode_json_limited(
-            response,
-            MAX_SIGNER_RESPONSE_BYTES,
-            "external signer response",
-        )
-        .await?;
-        let signature: [u8; 64] = hex::decode(&response.signature)
-            .ok()
-            .and_then(|value| value.try_into().ok())
-            .ok_or_else(|| {
-                Error::Unavailable("external signer returned an invalid signature".to_string())
-            })?;
-        self.verifying_key
-            .verify(message, &Signature::from_bytes(&signature))
-            .map_err(|_| {
-                Error::Unavailable(
-                    "external signer returned a signature for different bytes".to_string(),
-                )
-            })?;
-        Ok(response.signature)
-    }
-}
-
 #[async_trait]
 pub trait AuthorizationSource: Send + Sync {
     async fn resolve(
@@ -262,17 +124,62 @@ pub trait AuthorizationSource: Send + Sync {
     ) -> Result<SubjectSnapshot>;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectedChainReadKey {
+    Active,
+    Previous,
+}
+
+#[derive(Debug, Default)]
+struct SelectedChainReadKeyCache {
+    generation: u64,
+    entries: HashMap<String, (SelectedChainReadKey, u64)>,
+}
+
+impl SelectedChainReadKeyCache {
+    fn selected(&mut self, provider_address: &str) -> Option<SelectedChainReadKey> {
+        self.generation = self.generation.saturating_add(1);
+        let generation = self.generation;
+        self.entries
+            .get_mut(&provider_address.to_ascii_lowercase())
+            .map(|(selected, last_used)| {
+                *last_used = generation;
+                *selected
+            })
+    }
+
+    fn remember(&mut self, provider_address: &str, selected: SelectedChainReadKey) {
+        self.generation = self.generation.saturating_add(1);
+        let key = provider_address.to_ascii_lowercase();
+        if !self.entries.contains_key(&key) && self.entries.len() >= MAX_SELECTED_CHAIN_READ_KEYS {
+            if let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (_, last_used))| *last_used)
+                .map(|(provider, _)| provider.clone())
+            {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.entries.insert(key, (selected, self.generation));
+    }
+}
+
 #[derive(Clone)]
 pub struct ChainClient {
     client: reqwest::Client,
     rpc_url: Url,
     network: String,
     chain_id: String,
-    signers: Arc<BTreeMap<String, Arc<dyn RequestSigner>>>,
+    service_id: String,
+    active_signer: Arc<dyn RequestSigner>,
+    previous_signer: Option<Arc<dyn RequestSigner>>,
+    next_signer: Option<Arc<dyn RequestSigner>>,
+    selected_keys: Arc<Mutex<SelectedChainReadKeyCache>>,
 }
 
 impl ChainClient {
-    pub async fn from_config(config: &ChainConfig) -> Result<Self> {
+    pub async fn from_config(config: &ChainConfig, service_id: &str) -> Result<Self> {
         let rpc_url = Url::parse(&config.rpc_url)
             .map_err(|error| Error::Invalid(format!("invalid chain RPC URL: {error}")))?;
         let client = reqwest::Client::builder()
@@ -281,34 +188,91 @@ impl ChainClient {
             .pool_max_idle_per_host(8)
             .build()
             .map_err(|error| Error::Internal(format!("build chain client: {error}")))?;
-        let mut signers: BTreeMap<String, Arc<dyn RequestSigner>> = BTreeMap::new();
-        for (configured_address, signer_config) in &config.provider_signers {
-            let signer: Arc<dyn RequestSigner> = match signer_config {
-                ChainSignerConfig::LocalFile { secret_key_file } => {
-                    Arc::new(LocalRequestSigner::from_file(secret_key_file)?)
-                }
-                ChainSignerConfig::External {
-                    url,
-                    bearer_token_file,
-                } => Arc::new(
-                    ExternalRequestSigner::connect(url, bearer_token_file.as_deref()).await?,
-                ),
-            };
-            if !signer.address().eq_ignore_ascii_case(configured_address) {
-                return Err(Error::Invalid(format!(
-                    "chain signer address {} does not match configuration key {configured_address}",
-                    signer.address()
-                )));
-            }
-            signers.insert(configured_address.to_ascii_lowercase(), signer);
+        let active_signer: Arc<dyn RequestSigner> = Arc::new(LocalRequestSigner::from_file(
+            &config.chain_read_key.active_secret_key_file,
+        )?);
+        let (previous_signer, next_signer) = match &config.chain_read_key.standby {
+            Some(ChainReadStandbyKeyConfig::Previous { secret_key_file }) => (
+                Some(Arc::new(LocalRequestSigner::from_file(secret_key_file)?)
+                    as Arc<dyn RequestSigner>),
+                None,
+            ),
+            Some(ChainReadStandbyKeyConfig::Next { secret_key_file }) => (
+                None,
+                Some(Arc::new(LocalRequestSigner::from_file(secret_key_file)?)
+                    as Arc<dyn RequestSigner>),
+            ),
+            None => (None, None),
+        };
+        if previous_signer
+            .as_ref()
+            .is_some_and(|signer| signer.public_key_hex() == active_signer.public_key_hex())
+            || next_signer
+                .as_ref()
+                .is_some_and(|signer| signer.public_key_hex() == active_signer.public_key_hex())
+        {
+            return Err(Error::Invalid(
+                "active and standby chain-read keys must be distinct".to_string(),
+            ));
         }
         Ok(Self {
             client,
             rpc_url,
             network: config.network.clone(),
             chain_id: config.chain_id.clone(),
-            signers: Arc::new(signers),
+            service_id: service_id.to_string(),
+            active_signer,
+            previous_signer,
+            next_signer,
+            selected_keys: Arc::new(Mutex::new(SelectedChainReadKeyCache::default())),
         })
+    }
+
+    pub fn delegation_info(&self) -> ConversationDelegationInfo {
+        ConversationDelegationInfo {
+            protocol_version: 1,
+            service_id: self.service_id.clone(),
+            network: self.network.clone(),
+            chain_id: self.chain_id.clone(),
+            active_key: key_info(self.active_signer.as_ref()),
+            next_key: self.next_signer.as_deref().map(key_info),
+            required_scopes: vec![
+                "task_read".into(),
+                "task_lifecycle_read".into(),
+                "agreement_read".into(),
+                "agreement_lifecycle_read".into(),
+                "tool_job_read".into(),
+                "tool_job_lifecycle_read".into(),
+                "tool_usage_session_read".into(),
+                "tool_usage_session_lifecycle_read".into(),
+            ],
+            required_scope_mask: REQUIRED_SCOPE_MASK,
+            default_grant_lifetime_ms: DEFAULT_GRANT_LIFETIME_MS,
+            maximum_grant_lifetime_ms: MAX_GRANT_LIFETIME_MS,
+        }
+    }
+
+    pub fn lifecycle_delegate_addresses(&self) -> Vec<String> {
+        let mut addresses = vec![self.active_signer.address().to_string()];
+        if let Some(signer) = self
+            .previous_signer
+            .as_deref()
+            .or(self.next_signer.as_deref())
+        {
+            addresses.push(signer.address().to_string());
+        }
+        addresses
+    }
+
+    pub async fn delegation_lifecycle_events(
+        &self,
+        delegate_address: &str,
+        after_seq: i64,
+    ) -> Result<Value> {
+        let target = format!(
+            "/v1/rpc-read-delegations/delegate/{delegate_address}/lifecycle-events?after_seq={after_seq}&limit=100"
+        );
+        self.get_public(&target).await
     }
 
     async fn get_public(&self, target: &str) -> Result<Value> {
@@ -325,8 +289,15 @@ impl ChainClient {
         decode_api_response(response).await
     }
 
-    async fn get_signed(&self, target: &str, signer: &dyn RequestSigner) -> Result<Value> {
-        let headers = signed_headers(signer, "GET", target, &[]).await?;
+    async fn get_delegated_once(
+        &self,
+        target: &str,
+        provider_address: &str,
+        signer: &dyn RequestSigner,
+    ) -> Result<Value> {
+        let delegation_id =
+            rpc_read_delegation_id(provider_address, signer.public_key_hex(), &self.service_id)?;
+        let headers = delegated_headers(signer, "GET", target, &[], &delegation_id).await?;
         let url = self
             .rpc_url
             .join(target.trim_start_matches('/'))
@@ -339,6 +310,66 @@ impl ChainClient {
             .await
             .map_err(|error| Error::Unavailable(format!("chain RPC: {error}")))?;
         decode_api_response(response).await
+    }
+
+    async fn get_delegated(&self, target: &str, provider_address: &str) -> Result<Value> {
+        let selected = self
+            .selected_keys
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .selected(provider_address)
+            .filter(|selected| {
+                *selected != SelectedChainReadKey::Previous || self.previous_signer.is_some()
+            })
+            .unwrap_or(SelectedChainReadKey::Active);
+        let (first_role, first, fallback_role, fallback) = match selected {
+            SelectedChainReadKey::Active => (
+                SelectedChainReadKey::Active,
+                self.active_signer.as_ref(),
+                SelectedChainReadKey::Previous,
+                self.previous_signer.as_deref(),
+            ),
+            SelectedChainReadKey::Previous => (
+                SelectedChainReadKey::Previous,
+                self.previous_signer
+                    .as_deref()
+                    .expect("cached previous key exists"),
+                SelectedChainReadKey::Active,
+                Some(self.active_signer.as_ref()),
+            ),
+        };
+        match self
+            .get_delegated_once(target, provider_address, first)
+            .await
+        {
+            Ok(value) => {
+                self.remember_selected_key(provider_address, first_role);
+                Ok(value)
+            }
+            Err(Error::DelegationNotFound(_)) | Err(Error::DelegationExpired(_))
+                if fallback.is_some() =>
+            {
+                let result = self
+                    .get_delegated_once(
+                        target,
+                        provider_address,
+                        fallback.expect("checked fallback key"),
+                    )
+                    .await;
+                if result.is_ok() {
+                    self.remember_selected_key(provider_address, fallback_role);
+                }
+                result
+            }
+            result => result,
+        }
+    }
+
+    fn remember_selected_key(&self, provider_address: &str, selected: SelectedChainReadKey) {
+        self.selected_keys
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remember(provider_address, selected);
     }
 }
 
@@ -355,18 +386,12 @@ impl AuthorizationSource for ChainClient {
                 "subject network or chain ID does not match this service".to_string(),
             ));
         }
-        let signer = self
-            .signers
-            .get(&provider_address.to_ascii_lowercase())
-            .ok_or_else(|| {
-                Error::Forbidden("no provider chain signer is configured".to_string())
-            })?;
         let target = detail_target(subject);
         let mut coherent = None;
         for _ in 0..2 {
             let before = self.get_public("/v1/chain/info").await?;
             let before_marker = chain_marker(&before, &self.chain_id)?;
-            let detail = self.get_signed(&target, signer.as_ref()).await?;
+            let detail = self.get_delegated(&target, provider_address).await?;
             let status = string_field(&detail, "status")?.to_ascii_lowercase();
             let terminal = detail
                 .get("terminal_summary")
@@ -380,7 +405,7 @@ impl AuthorizationSource for ChainClient {
                     .is_none()
             {
                 Some(
-                    self.latest_lifecycle_marker(subject, signer.as_ref())
+                    self.latest_lifecycle_marker(subject, provider_address)
                         .await?,
                 )
             } else {
@@ -409,10 +434,10 @@ impl AuthorizationSource for ChainClient {
         }
         if !participants
             .iter()
-            .any(|participant| participant.address.eq_ignore_ascii_case(signer.address()))
+            .any(|participant| participant.address.eq_ignore_ascii_case(provider_address))
         {
             return Err(Error::Forbidden(
-                "configured provider signer is not a workflow participant".to_string(),
+                "workflow provider is not a participant".to_string(),
             ));
         }
         let terminal = detail
@@ -460,14 +485,14 @@ impl ChainClient {
     async fn latest_lifecycle_marker(
         &self,
         subject: &SubjectRef,
-        signer: &dyn RequestSigner,
+        provider_address: &str,
     ) -> Result<(i64, i64)> {
         const MAX_PAGES: usize = 4;
         let mut after = 0_i64;
         let mut latest = None;
         for _ in 0..MAX_PAGES {
             let lifecycle = self
-                .get_signed(&lifecycle_target(subject, after), signer)
+                .get_delegated(&lifecycle_target(subject, after), provider_address)
                 .await?;
             if let Some(items) = lifecycle.get("items").and_then(Value::as_array) {
                 for item in items {
@@ -520,17 +545,18 @@ impl ChainClient {
     }
 }
 
-pub async fn signed_headers(
+pub async fn delegated_headers(
     signer: &dyn RequestSigner,
     method: &str,
     target: &str,
     body: &[u8],
+    delegation_id: &str,
 ) -> Result<HeaderMap> {
     let timestamp = now_ms();
     let nonce = random_token();
     let body_hash = hex::encode(Sha256::digest(body));
     let message = [
-        SIGNED_REQUEST_DOMAIN.to_string(),
+        DELEGATED_REQUEST_DOMAIN.to_string(),
         method.to_ascii_uppercase(),
         target.to_string(),
         timestamp.to_string(),
@@ -538,6 +564,7 @@ pub async fn signed_headers(
         body_hash.clone(),
         signer.address().to_string(),
         signer.public_key_hex().to_string(),
+        delegation_id.to_string(),
     ]
     .join("\n");
     let signature = signer.sign(message.as_bytes()).await?;
@@ -549,6 +576,7 @@ pub async fn signed_headers(
         ("x-zincha-timestamp-ms", timestamp.to_string()),
         ("x-zincha-nonce", nonce),
         ("x-zincha-body-sha256", body_hash),
+        ("x-zincha-delegation-id", delegation_id.to_string()),
     ] {
         headers.insert(
             HeaderName::from_bytes(name.as_bytes())
@@ -560,8 +588,59 @@ pub async fn signed_headers(
     Ok(headers)
 }
 
+pub fn rpc_read_delegation_id(
+    delegator_address: &str,
+    delegate_public_key_hex: &str,
+    service_id: &str,
+) -> Result<String> {
+    let address = delegator_address
+        .strip_prefix("zn1")
+        .unwrap_or(delegator_address);
+    let address: [u8; 20] = hex::decode(address)
+        .ok()
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| Error::Invalid("delegator address is invalid".to_string()))?;
+    let public_key: [u8; 32] = hex::decode(delegate_public_key_hex)
+        .ok()
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| Error::Invalid("delegate public key is invalid".to_string()))?;
+    if service_id.is_empty()
+        || service_id.trim() != service_id
+        || service_id.chars().count() > 256
+        || service_id.chars().any(char::is_control)
+    {
+        return Err(Error::Invalid(
+            "delegation service ID is invalid".to_string(),
+        ));
+    }
+    let service = service_id.as_bytes();
+    let length = u32::try_from(service.len())
+        .map_err(|_| Error::Invalid("delegation service ID is too long".to_string()))?;
+    let mut material = Vec::with_capacity(
+        DELEGATION_ID_DOMAIN.len() + address.len() + public_key.len() + 4 + service.len(),
+    );
+    material.extend_from_slice(DELEGATION_ID_DOMAIN);
+    material.extend_from_slice(&address);
+    material.extend_from_slice(&public_key);
+    material.extend_from_slice(&length.to_be_bytes());
+    material.extend_from_slice(service);
+    Ok(hex::encode(Sha256::digest(material)))
+}
+
+fn key_info(signer: &dyn RequestSigner) -> ChainReadKeyInfo {
+    ChainReadKeyInfo {
+        public_key: signer.public_key_hex().to_string(),
+        address: signer.address().to_string(),
+    }
+}
+
 async fn decode_api_response(response: reqwest::Response) -> Result<Value> {
     let status = response.status();
+    let delegation_code = response
+        .headers()
+        .get("x-zincha-error-code")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
     let value: Value =
         decode_json_limited(response, MAX_CHAIN_RESPONSE_BYTES, "chain RPC response").await?;
     if !status.is_success() || value.get("success").and_then(Value::as_bool) != Some(true) {
@@ -569,13 +648,20 @@ async fn decode_api_response(response: reqwest::Response) -> Result<Value> {
             .get("error")
             .and_then(Value::as_str)
             .unwrap_or("chain request failed");
-        return match status.as_u16() {
-            401 => Err(Error::Authentication(message.to_string())),
-            403 => Err(Error::Forbidden(message.to_string())),
-            404 => Err(Error::NotFound(message.to_string())),
-            _ => Err(Error::Unavailable(format!(
-                "chain HTTP {status}: {message}"
-            ))),
+        return match delegation_code.as_deref() {
+            Some("delegation_not_found") => Err(Error::DelegationNotFound(message.to_string())),
+            Some("delegation_expired") => Err(Error::DelegationExpired(message.to_string())),
+            Some("delegation_scope_denied")
+            | Some("delegation_delegate_mismatch")
+            | Some("delegation_invalid") => Err(Error::Forbidden(message.to_string())),
+            _ => match status.as_u16() {
+                401 => Err(Error::Authentication(message.to_string())),
+                403 => Err(Error::Forbidden(message.to_string())),
+                404 => Err(Error::NotFound(message.to_string())),
+                _ => Err(Error::Unavailable(format!(
+                    "chain HTTP {status}: {message}"
+                ))),
+            },
         };
     }
     value
@@ -822,8 +908,8 @@ mod tests {
     use super::*;
     use axum::{
         extract::State,
-        http::{HeaderMap as AxumHeaderMap, Uri},
-        response::Json,
+        http::{HeaderMap as AxumHeaderMap, StatusCode, Uri},
+        response::{IntoResponse, Json, Response},
         Router,
     };
     use std::sync::{
@@ -839,7 +925,11 @@ mod tests {
 
     impl TestSigner {
         fn new() -> Self {
-            let key = SigningKey::from_bytes(&[11; 32]);
+            Self::from_seed_byte(11)
+        }
+
+        fn from_seed_byte(seed: u8) -> Self {
+            let key = SigningKey::from_bytes(&[seed; 32]);
             let public_key = hex::encode(key.verifying_key().to_bytes());
             let address = address_from_public_key(&key.verifying_key().to_bytes());
             Self {
@@ -848,6 +938,39 @@ mod tests {
                 public_key,
             }
         }
+    }
+
+    struct FallbackChainState {
+        active_public_key: String,
+        previous_public_key: String,
+        active_error_code: &'static str,
+        requests: StdMutex<Vec<String>>,
+    }
+
+    async fn mock_delegation_fallback(
+        State(state): State<Arc<FallbackChainState>>,
+        headers: AxumHeaderMap,
+    ) -> Response {
+        let public_key = headers
+            .get("x-zincha-public-key")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(headers.contains_key("x-zincha-delegation-id"));
+        state.requests.lock().unwrap().push(public_key.clone());
+        if public_key == state.active_public_key {
+            return (
+                StatusCode::UNAUTHORIZED,
+                [("x-zincha-error-code", state.active_error_code)],
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": state.active_error_code,
+                })),
+            )
+                .into_response();
+        }
+        assert_eq!(public_key, state.previous_public_key);
+        Json(serde_json::json!({"success": true, "data": {"ok": true}})).into_response()
     }
 
     #[async_trait]
@@ -876,6 +999,8 @@ mod tests {
     struct MockChainState {
         mode: MockMode,
         provider: String,
+        expected_delegation_id: String,
+        service_address: String,
         chain_calls: AtomicUsize,
         lifecycle_calls: AtomicUsize,
         order: StdMutex<Vec<String>>,
@@ -907,6 +1032,18 @@ mod tests {
             })
         } else if path.ends_with("/lifecycle-events") {
             assert!(headers.contains_key("x-zincha-signature"));
+            assert_eq!(
+                headers
+                    .get("x-zincha-delegation-id")
+                    .and_then(|value| value.to_str().ok()),
+                Some(state.expected_delegation_id.as_str())
+            );
+            assert_eq!(
+                headers
+                    .get("x-zincha-address")
+                    .and_then(|value| value.to_str().ok()),
+                Some(state.service_address.as_str())
+            );
             state.order.lock().unwrap().push("lifecycle".to_string());
             state.lifecycle_calls.fetch_add(1, Ordering::SeqCst);
             let after = uri
@@ -927,6 +1064,18 @@ mod tests {
             })
         } else if path.starts_with("/v1/tasks/") {
             assert!(headers.contains_key("x-zincha-signature"));
+            assert_eq!(
+                headers
+                    .get("x-zincha-delegation-id")
+                    .and_then(|value| value.to_str().ok()),
+                Some(state.expected_delegation_id.as_str())
+            );
+            assert_eq!(
+                headers
+                    .get("x-zincha-address")
+                    .and_then(|value| value.to_str().ok()),
+                Some(state.service_address.as_str())
+            );
             state.order.lock().unwrap().push("detail".to_string());
             match state.mode {
                 MockMode::MovingHead => serde_json::json!({
@@ -958,14 +1107,26 @@ mod tests {
         mode: MockMode,
     ) -> (
         ChainClient,
-        Arc<TestSigner>,
+        String,
         Arc<MockChainState>,
         tokio::task::JoinHandle<()>,
     ) {
         let signer = Arc::new(TestSigner::new());
+        // The provider has no signer or callback in this test. Only the
+        // service key exists; the mock node projects its on-chain grant back
+        // to this independent provider address.
+        let provider = address_from_public_key(&[99; 32]);
+        let service_id = "marketplace.example/conversations";
         let state = Arc::new(MockChainState {
             mode,
-            provider: signer.address.clone(),
+            provider: provider.clone(),
+            expected_delegation_id: rpc_read_delegation_id(
+                &provider,
+                &signer.public_key,
+                service_id,
+            )
+            .unwrap(),
+            service_address: signer.address.clone(),
             chain_calls: AtomicUsize::new(0),
             lifecycle_calls: AtomicUsize::new(0),
             order: StdMutex::new(Vec::new()),
@@ -976,16 +1137,55 @@ mod tests {
         let task = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        let mut signers: BTreeMap<String, Arc<dyn RequestSigner>> = BTreeMap::new();
-        signers.insert(signer.address.clone(), signer.clone());
         let client = ChainClient {
             client: reqwest::Client::new(),
             rpc_url: Url::parse(&format!("http://{address}/")).unwrap(),
             network: "testnet".to_string(),
             chain_id: "zincha-test".to_string(),
-            signers: Arc::new(signers),
+            service_id: service_id.to_string(),
+            active_signer: signer.clone(),
+            previous_signer: None,
+            next_signer: None,
+            selected_keys: Arc::new(Mutex::new(SelectedChainReadKeyCache::default())),
         };
-        (client, signer, state, task)
+        (client, provider, state, task)
+    }
+
+    async fn fallback_client(
+        active_error_code: &'static str,
+    ) -> (
+        ChainClient,
+        Arc<FallbackChainState>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let active = Arc::new(TestSigner::from_seed_byte(21));
+        let previous = Arc::new(TestSigner::from_seed_byte(22));
+        let state = Arc::new(FallbackChainState {
+            active_public_key: active.public_key.clone(),
+            previous_public_key: previous.public_key.clone(),
+            active_error_code,
+            requests: StdMutex::new(Vec::new()),
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .fallback(mock_delegation_fallback)
+            .with_state(state.clone());
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = ChainClient {
+            client: reqwest::Client::new(),
+            rpc_url: Url::parse(&format!("http://{address}/")).unwrap(),
+            network: "testnet".to_string(),
+            chain_id: "zincha-test".to_string(),
+            service_id: "marketplace.example/conversations".to_string(),
+            active_signer: active,
+            previous_signer: Some(previous),
+            next_signer: None,
+            selected_keys: Arc::new(Mutex::new(SelectedChainReadKeyCache::default())),
+        };
+        (client, state, task)
     }
 
     fn task_subject() -> SubjectRef {
@@ -1139,9 +1339,9 @@ mod tests {
 
     #[tokio::test]
     async fn terminal_projection_reads_lifecycle_inside_one_coherent_marker() {
-        let (client, signer, state, task) = mock_client(MockMode::StableTerminal).await;
+        let (client, provider, state, task) = mock_client(MockMode::StableTerminal).await;
         let snapshot = client
-            .resolve(&task_subject(), signer.address(), 7 * 24 * 60 * 60 * 1_000)
+            .resolve(&task_subject(), &provider, 7 * 24 * 60 * 60 * 1_000)
             .await
             .unwrap();
         task.abort();
@@ -1162,9 +1362,9 @@ mod tests {
 
     #[tokio::test]
     async fn moving_chain_head_fails_closed_after_two_bounded_attempts() {
-        let (client, signer, state, task) = mock_client(MockMode::MovingHead).await;
+        let (client, provider, state, task) = mock_client(MockMode::MovingHead).await;
         let error = client
-            .resolve(&task_subject(), signer.address(), 7 * 24 * 60 * 60 * 1_000)
+            .resolve(&task_subject(), &provider, 7 * 24 * 60 * 60 * 1_000)
             .await
             .unwrap_err();
         task.abort();
@@ -1181,9 +1381,9 @@ mod tests {
 
     #[tokio::test]
     async fn lifecycle_projection_rejects_history_beyond_its_page_bound() {
-        let (client, signer, state, task) = mock_client(MockMode::EndlessLifecycle).await;
+        let (client, provider, state, task) = mock_client(MockMode::EndlessLifecycle).await;
         let error = client
-            .latest_lifecycle_marker(&task_subject(), signer.as_ref())
+            .latest_lifecycle_marker(&task_subject(), &provider)
             .await
             .unwrap_err();
         task.abort();
@@ -1194,13 +1394,78 @@ mod tests {
 
     #[tokio::test]
     async fn chain_projection_rejects_oversized_responses_before_decoding() {
-        let (client, signer, _state, task) = mock_client(MockMode::OversizedResponse).await;
+        let (client, provider, _state, task) = mock_client(MockMode::OversizedResponse).await;
         let error = client
-            .resolve(&task_subject(), signer.address(), 7 * 24 * 60 * 60 * 1_000)
+            .resolve(&task_subject(), &provider, 7 * 24 * 60 * 60 * 1_000)
             .await
             .unwrap_err();
         task.abort();
 
         assert!(error.to_string().contains("exceeds 2097152 bytes"));
+    }
+
+    #[tokio::test]
+    async fn previous_key_fallback_is_limited_to_missing_or_expired_grants() {
+        for code in ["delegation_not_found", "delegation_expired"] {
+            let (client, state, task) = fallback_client(code).await;
+            let value = client
+                .get_delegated(
+                    "/v1/tasks/fixture",
+                    "zn100112233445566778899aabbccddeeff00112233",
+                )
+                .await
+                .expect("previous key fallback");
+            assert_eq!(value["ok"], true);
+            assert_eq!(state.requests.lock().unwrap().len(), 2);
+
+            let value = client
+                .get_delegated(
+                    "/v1/tasks/fixture",
+                    "zn100112233445566778899aabbccddeeff00112233",
+                )
+                .await
+                .expect("remember selected previous key");
+            task.abort();
+            assert_eq!(value["ok"], true);
+            assert_eq!(state.requests.lock().unwrap().len(), 3);
+        }
+
+        for code in [
+            "delegation_scope_denied",
+            "delegation_delegate_mismatch",
+            "delegation_invalid",
+        ] {
+            let (client, state, task) = fallback_client(code).await;
+            let error = client
+                .get_delegated(
+                    "/v1/tasks/fixture",
+                    "zn100112233445566778899aabbccddeeff00112233",
+                )
+                .await
+                .expect_err("security failures must be terminal");
+            task.abort();
+            assert!(matches!(error, Error::Forbidden(_)));
+            assert_eq!(state.requests.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn generated_chain_read_key_is_private_valid_and_never_overwritten() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("chain-read.key");
+        let info = generate_chain_read_key(&path).expect("generate chain-read key");
+        let signer = LocalRequestSigner::from_file(&path).expect("load generated key");
+        assert_eq!(info.public_key, signer.public_key_hex());
+        assert_eq!(info.address, signer.address());
+        assert!(generate_chain_read_key(&path).is_err());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
     }
 }

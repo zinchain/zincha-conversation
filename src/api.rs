@@ -73,6 +73,7 @@ pub fn router(service: ConversationService) -> Router {
         .route("/readyz", get(ready))
         .route("/metrics", get(metrics))
         .route("/v1/profile", get(profile))
+        .route("/v1/delegation-info", get(delegation_info))
         .route("/v1/auth/challenges", post(issue_challenge))
         .route("/v1/auth/sessions", post(create_session))
         .route(
@@ -124,6 +125,10 @@ async fn metrics(State(service): State<ConversationService>) -> impl IntoRespons
 
 async fn profile(State(service): State<ConversationService>) -> impl IntoResponse {
     ok(service.profile().clone())
+}
+
+async fn delegation_info(State(service): State<ConversationService>) -> Result<impl IntoResponse> {
+    Ok(ok(service.delegation_info()?.clone()))
 }
 
 async fn issue_challenge(

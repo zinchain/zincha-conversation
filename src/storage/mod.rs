@@ -145,6 +145,53 @@ impl Database {
         Ok(())
     }
 
+    pub async fn delegation_lifecycle_cursor(&self, delegate_address: &str) -> Result<i64> {
+        let cursor = match self {
+            Self::Sqlite(pool) => sqlx::query_scalar::<_, i64>(
+                "SELECT cursor FROM chain_read_delegation_lifecycle_cursors WHERE delegate_address = ?",
+            )
+            .bind(delegate_address)
+            .fetch_optional(pool)
+            .await?,
+            Self::Postgres(pool) => sqlx::query_scalar::<_, i64>(
+                "SELECT cursor FROM chain_read_delegation_lifecycle_cursors WHERE delegate_address = $1",
+            )
+            .bind(delegate_address)
+            .fetch_optional(pool)
+            .await?,
+        };
+        Ok(cursor.unwrap_or(0))
+    }
+
+    pub async fn set_delegation_lifecycle_cursor(
+        &self,
+        delegate_address: &str,
+        cursor: i64,
+    ) -> Result<()> {
+        let current = now_ms();
+        match self {
+            Self::Sqlite(pool) => {
+                sqlx::query("INSERT INTO chain_read_delegation_lifecycle_cursors (delegate_address, cursor, updated_at_ms) VALUES (?, ?, ?) ON CONFLICT(delegate_address) DO UPDATE SET cursor=MAX(chain_read_delegation_lifecycle_cursors.cursor, excluded.cursor), updated_at_ms=excluded.updated_at_ms")
+                    .bind(delegate_address).bind(cursor).bind(current).execute(pool).await?;
+            }
+            Self::Postgres(pool) => {
+                sqlx::query("INSERT INTO chain_read_delegation_lifecycle_cursors (delegate_address, cursor, updated_at_ms) VALUES ($1, $2, $3) ON CONFLICT(delegate_address) DO UPDATE SET cursor=GREATEST(chain_read_delegation_lifecycle_cursors.cursor, EXCLUDED.cursor), updated_at_ms=EXCLUDED.updated_at_ms")
+                    .bind(delegate_address).bind(cursor).bind(current).execute(pool).await?;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn invalidate_provider_authorization(&self, provider_address: &str) -> Result<u64> {
+        let affected = match self {
+            Self::Sqlite(pool) => sqlx::query("UPDATE conversations SET snapshot_json=json_set(snapshot_json, '$.observed_at_ms', 0) WHERE json_extract(snapshot_json, '$.provider') = ?")
+                .bind(provider_address).execute(pool).await?.rows_affected(),
+            Self::Postgres(pool) => sqlx::query("UPDATE conversations SET snapshot_json=jsonb_set(snapshot_json, '{observed_at_ms}', '0'::jsonb, false) WHERE snapshot_json->>'provider' = $1")
+                .bind(provider_address).execute(pool).await?.rows_affected(),
+        };
+        Ok(affected)
+    }
+
     pub async fn create_challenge(&self, challenge: &StoredChallenge) -> Result<()> {
         let subject = serde_json::to_value(&challenge.subject)?;
         match self {

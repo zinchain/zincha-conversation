@@ -33,12 +33,15 @@ rpc_url = "https://rpc.example.zincha.com"
 network = "mainnet"
 chain_id = "zincha-mainnet-1"
 
-# A conversation service reads private workflow records as the workflow's
-# provider. The address key must match the configured signer exactly.
-[chain.provider_signers."zn10000000000000000000000000000000000000001"]
-type = "external"
-url = "http://127.0.0.1:9910"
-bearer_token_file = "/run/secrets/zincha-provider-signer-token"
+# A dedicated service key signs narrowly scoped delegated chain reads. Providers
+# authorize this public key on-chain; their private keys and endpoints are not
+# configured in this service. During rotation configure at most one standby.
+[chain.chain_read_key]
+active_secret_key_file = "/run/secrets/zincha-chain-read-key.pem"
+
+#[chain.chain_read_key.standby]
+#role = "next" # change to "previous" after promotion
+#secret_key_file = "/run/secrets/zincha-chain-read-next-key.pem"
 
 [encryption]
 # Exactly 32 random bytes encoded as 64 hex characters. Mount this from a

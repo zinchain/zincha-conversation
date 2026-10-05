@@ -3557,7 +3557,7 @@ dependencies = [
 [[package]]
 name = "zincha-client"
 version = "0.1.0"
-source = "git+https://github.com/zinchain/zincha-sdk.git?rev=29bc9f20fd82be069bd770a212695ef89da93ac8#29bc9f20fd82be069bd770a212695ef89da93ac8"
+source = "git+https://github.com/zinchain/zincha-sdk.git?rev=0c175099d5f4c74b7b6204eae488f8c3d3dd043a#0c175099d5f4c74b7b6204eae488f8c3d3dd043a"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -3636,7 +3636,7 @@ dependencies = [
 [[package]]
 name = "zincha-primitives"
 version = "0.1.0"
-source = "git+https://github.com/zinchain/zincha-sdk.git?rev=29bc9f20fd82be069bd770a212695ef89da93ac8#29bc9f20fd82be069bd770a212695ef89da93ac8"
+source = "git+https://github.com/zinchain/zincha-sdk.git?rev=0c175099d5f4c74b7b6204eae488f8c3d3dd043a#0c175099d5f4c74b7b6204eae488f8c3d3dd043a"
 dependencies = [
  "argon2",
  "bincode",

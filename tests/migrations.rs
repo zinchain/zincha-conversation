@@ -4,6 +4,7 @@ use sqlx::{
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
     Row,
 };
+use zincha_conversation::storage::Database;
 
 #[tokio::test]
 async fn sqlite_capability_migration_backfills_existing_delegations() {
@@ -55,4 +56,33 @@ async fn sqlite_capability_migration_backfills_existing_delegations() {
         .unwrap();
     assert!(row.try_get::<bool, _>("can_read").unwrap());
     assert!(row.try_get::<bool, _>("can_write").unwrap());
+}
+
+#[tokio::test]
+async fn sqlite_delegation_lifecycle_cursor_is_durable_and_monotonic() {
+    let database = Database::connect("sqlite::memory:", 1).await.unwrap();
+    database.migrate().await.unwrap();
+    let delegate = "zn100112233445566778899aabbccddeeff00112233";
+    assert_eq!(
+        database
+            .delegation_lifecycle_cursor(delegate)
+            .await
+            .unwrap(),
+        0
+    );
+    database
+        .set_delegation_lifecycle_cursor(delegate, 7)
+        .await
+        .unwrap();
+    database
+        .set_delegation_lifecycle_cursor(delegate, 3)
+        .await
+        .unwrap();
+    assert_eq!(
+        database
+            .delegation_lifecycle_cursor(delegate)
+            .await
+            .unwrap(),
+        7
+    );
 }

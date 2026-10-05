@@ -1,5 +1,4 @@
 use std::{
-    collections::BTreeMap,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
@@ -22,7 +21,7 @@ use zincha_client::conversation as sdk;
 use zincha_conversation::{
     chain::AuthorizationSource,
     config::{
-        ChainConfig, ChainSignerConfig, DatabaseConfig, EncryptionConfig, LimitsConfig,
+        ChainConfig, ChainReadKeyConfig, DatabaseConfig, EncryptionConfig, LimitsConfig,
         RetentionConfig, ServiceConfig, ServiceInterfaceConfig,
     },
     crypto::{
@@ -156,12 +155,10 @@ async fn fixture() -> Fixture {
             rpc_url: "http://127.0.0.1:9944".to_string(),
             network: subject.network.clone(),
             chain_id: subject.chain_id.clone(),
-            provider_signers: BTreeMap::from([(
-                provider.clone(),
-                ChainSignerConfig::LocalFile {
-                    secret_key_file: temp.path().join("unused-provider-key"),
-                },
-            )]),
+            chain_read_key: ChainReadKeyConfig {
+                active_secret_key_file: temp.path().join("unused-chain-read-key"),
+                standby: None,
+            },
         },
         encryption: EncryptionConfig {
             local_master_key_file: temp.path().join("unused-master-key"),

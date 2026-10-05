@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     net::{IpAddr, SocketAddr},
     path::PathBuf,
 };
@@ -144,20 +144,22 @@ pub struct ChainConfig {
     pub rpc_url: String,
     pub network: String,
     pub chain_id: String,
-    #[serde(default)]
-    pub provider_signers: BTreeMap<String, ChainSignerConfig>,
+    pub chain_read_key: ChainReadKeyConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ChainSignerConfig {
-    LocalFile {
-        secret_key_file: PathBuf,
-    },
-    External {
-        url: String,
-        bearer_token_file: Option<PathBuf>,
-    },
+#[serde(deny_unknown_fields)]
+pub struct ChainReadKeyConfig {
+    pub active_secret_key_file: PathBuf,
+    #[serde(default)]
+    pub standby: Option<ChainReadStandbyKeyConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "role", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ChainReadStandbyKeyConfig {
+    Previous { secret_key_file: PathBuf },
+    Next { secret_key_file: PathBuf },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -423,34 +425,10 @@ impl Config {
             || self.chain.chain_id.len() > 128
             || self.chain.network.chars().any(char::is_control)
             || self.chain.chain_id.chars().any(char::is_control)
-            || self.chain.provider_signers.is_empty()
         {
             return Err(Error::Invalid(
-                "chain network, chain_id, and at least one provider signer are required"
-                    .to_string(),
+                "chain network and chain_id are required".to_string(),
             ));
-        }
-        for (address, signer) in &self.chain.provider_signers {
-            if !is_canonical_address(address) {
-                return Err(Error::Invalid(format!(
-                    "provider signer key is not a canonical address: {address}"
-                )));
-            }
-            if let ChainSignerConfig::External { url, .. } = signer {
-                let parsed = url::Url::parse(url)
-                    .map_err(|_| Error::Invalid(format!("invalid external signer URL: {url}")))?;
-                if !secure_http_url(&parsed) {
-                    return Err(Error::Invalid(
-                        "external signer URL must use HTTPS, except for loopback development"
-                            .to_string(),
-                    ));
-                }
-                if parsed.query().is_some() || parsed.fragment().is_some() {
-                    return Err(Error::Invalid(
-                        "external signer URL cannot contain a query or fragment".to_string(),
-                    ));
-                }
-            }
         }
         let rpc_url = url::Url::parse(&self.chain.rpc_url).ok();
         if !rpc_url.as_ref().is_some_and(|url| {
@@ -531,15 +509,6 @@ fn secure_http_url(url: &url::Url) -> bool {
             || (url.scheme() == "http" && url.host_str().is_some_and(is_loopback_hostname)))
 }
 
-fn is_canonical_address(value: &str) -> bool {
-    value.strip_prefix("zn1").is_some_and(|body| {
-        body.len() == 40
-            && body
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    })
-}
-
 fn is_loopback_hostname(host: &str) -> bool {
     host.eq_ignore_ascii_case("localhost")
         || host
@@ -614,9 +583,8 @@ url = "sqlite::memory:"
 rpc_url = "http://127.0.0.1:9944"
 network = "testnet"
 chain_id = "test"
-[chain.provider_signers."zn10000000000000000000000000000000000000001"]
-type = "local_file"
-secret_key_file = "/tmp/provider.key"
+[chain.chain_read_key]
+active_secret_key_file = "/tmp/chain-read.key"
 [encryption]
 local_master_key_file = "/tmp/master.key"
 [retention]

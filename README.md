@@ -6,7 +6,10 @@ The service has no unsolicited inbox. A caller must prove an account-signed dele
 
 ## Runtime design
 
-- Existing participant-authorized Zincha node endpoints supply the requester, provider, parties, arbitrators, status, and terminal lifecycle timestamp. No new node endpoint or consensus rule is required.
+- Existing private workflow endpoints supply the requester, provider, parties,
+  arbitrators, status, and terminal lifecycle timestamp. A bounded on-chain
+  grant lets the service read them as the provider without holding the
+  provider's key or calling a provider-hosted signer.
 - An account signs a bounded `ConversationKeyDelegationV1` once. The delegated Ed25519 key authenticates challenges and messages without asking a wallet to sign every conversational turn.
 - The server refreshes chain authorization when its cached projection is older than the configured staleness limit. Concurrent stale requests for one conversation share one in-flight refresh, and normal message reads and writes do not call the node.
 - PostgreSQL is the production store. SQLite with WAL mode is supported for one local process.
@@ -33,7 +36,18 @@ openssl rand -hex 32 > /run/secrets/zincha-conversation-master-key
 chmod 600 /run/secrets/zincha-conversation-master-key
 ```
 
-Copy [`config.example.toml`](config.example.toml), configure at least one provider signer, then run:
+Generate the service's dedicated chain-read key. This key is separate from TLS,
+message encryption, and the at-rest master key:
+
+```sh
+zincha-conversation chain-read-key generate \
+  --secret-key /run/secrets/zincha-chain-read-key.hex
+```
+
+The command refuses to overwrite a file, creates it with mode 0600 on Unix,
+and prints only the public key and address. Copy
+[`config.example.toml`](config.example.toml), point
+`chain.chain_read_key.active_secret_key_file` at that file, then run:
 
 ```sh
 cargo run --release -- migrate --config conversation.toml
@@ -75,24 +89,25 @@ proxies and must never be advertised as a public interface. For IPv6, place the
 canonical literal address in `host` without brackets; clients add brackets when
 constructing the URL.
 
-The external signer contract is deliberately narrow:
-
-- `GET /v1/identity` returns `{"address":"zn1…","public_key":"<32-byte hex>"}`.
-- `POST /v1/sign` accepts `{"message_base64":"…","purpose":"zincha-rpc-signed-request-v1"}` and returns `{"signature":"<64-byte hex>"}`.
-
-The signer should bind its listener to localhost or mutual TLS, allow only the signed-request purpose, and enforce operator policy. A raw 32-byte hex or PKCS#8 Ed25519 key file is supported for local development.
-The service refuses master-key, local signer-key, and signer bearer-token files
-that are not regular files or that grant group/other permissions on Unix.
+The chain-read key may be raw 32-byte lowercase hex or PKCS#8 Ed25519 PEM. The
+service refuses master-key and chain-read-key files that are not private regular
+files. There is no `/v1/identity` or `/v1/sign` callback, provider signer token,
+or per-provider signer map.
 
 ## Client flow
 
 1. Read the provider's `ConversationProfileV2` from authenticated on-chain agent metadata. Select the first supported interface in provider order and require `GET /v1/profile` to match the on-chain bytes exactly before sending a credential or workflow identifier.
-2. Request a challenge with the account address and workflow reference.
-3. Sign a bounded delegation with the account key and the challenge with its delegated operational key.
-4. Create a short-lived bearer session.
-5. Resolve the conversation. The service independently reads the workflow using the provider's signed-request identity and confirms both participants.
-6. Sign and enqueue messages locally. Retry the same message ID until accepted.
-7. Catch up with paged message reads, then follow SSE using the last durable sequence. On `resync_required`, return to paged reads; on `authorization_required`, create a new session. Acknowledge the highest processed sequence only after local processing succeeds.
+2. Read `GET /v1/delegation-info`, submit the generated scoped grant transaction
+   for the active key, and wait for finality. The SDK defaults to 30 days.
+3. Request a challenge with the account address and workflow reference.
+4. Sign a bounded conversation-key delegation with the account key and the
+   challenge with its delegated operational key.
+5. Create a short-lived bearer session.
+6. Resolve the conversation. The service signs its own delegated node reads;
+   the node resolves the grant to the provider and applies the existing
+   participant checks.
+7. Sign and enqueue messages locally. Retry the same message ID until accepted.
+8. Catch up with paged message reads, then follow SSE using the last durable sequence. On `resync_required`, return to paged reads; on `authorization_required`, create a new session. Acknowledge the highest processed sequence only after local processing succeeds.
 
 See [`openapi.yaml`](openapi.yaml) for the HTTP contract. The Rust, TypeScript, and Python implementations live in [`zincha-sdk`](https://github.com/zinchain/zincha-sdk).
 
@@ -102,10 +117,16 @@ See [`openapi.yaml`](openapi.yaml) for the HTTP contract. The Rust, TypeScript, 
 - Direct TLS permits one active and one next certificate pin. Rotate by publishing both pins, waiting for chain finality and profile-cache expiry, activating the new certificate, verifying both advertised interfaces, and then publishing only the new pin. A pin mismatch is a terminal security error and never triggers fallback.
 - Binding port 443 directly under systemd requires `AmbientCapabilities=CAP_NET_BIND_SERVICE` and `CapabilityBoundingSet=CAP_NET_BIND_SERVICE`. Container deployments can use `-p 443:8443` with `listen = "0.0.0.0:8443"`. Open TCP 443 for both IPv4 and IPv6 where advertised.
 - Configure an explicit `allowed_origins` list for browser SDK callers. The service never enables wildcard credentialed CORS.
-- Keep the provider signing key, payload master key, and database backups in separate security domains.
+- Keep the chain-read key, payload master key, TLS key, and database backups in
+  separate security domains. The provider account key remains with the
+  provider.
 - Backups must include the database and the exact master-key version. Test restoration before reducing backup retention.
 - Set retention values deliberately. The process refuses zero values.
-- Rotate operational delegations rather than long-lived account keys. Revocation invalidates all sessions backed by that delegation immediately.
+- Rotate operational conversation delegations rather than long-lived account
+  keys. Revocation invalidates all sessions backed by that delegation
+  immediately. Rotate the service chain-read key by exposing a next key,
+  collecting grants, promoting it, retaining the old key as previous during the
+  bounded migration window, then revoking old grants and removing the key.
 - Scrape `GET /metrics` for lock-free message, retry, cumulative insert-time, authorization-refresh, SSE-resync, authorization-close, maintenance-deletion, active-SSE, in-flight-message, TLS connection/handshake/rejection, and current/maximum event-loop-lag metrics. TLS labels contain only the bounded transport name. Direct TLS retains one connection permit per live socket and caps sockets at the configured SSE capacity plus ordinary-request capacity. Monitor `429` responses and retention deletion warnings alongside these counters.
 - Size the reverse proxy for at least the configured `max_sse_connections`; ordinary-request concurrency is isolated from long-lived streams so 10,000 idle SSE clients do not consume every message/API request slot.
 - Start from [`deploy/haproxy-https.cfg.example`](deploy/haproxy-https.cfg.example) when a Web-PKI proxy must serve a large SSE population. It terminates public TLS and multiplexes streams to the service's private HTTP/2 listener, avoiding one backend socket and its service-side state per downstream stream. Normal access logging is disabled in both proxy examples; bounded service metrics cover routine traffic while proxy warnings and errors remain available without placing every conversation path on the request-critical logging path. [`deploy/nginx-https.conf.example`](deploy/nginx-https.conf.example) remains suitable when that extra SSE socket/RSS cost is provisioned. Both examples preserve long request lifetimes so connection rotation does not make a running stream depend on fresh DNS resolution.
@@ -123,6 +144,8 @@ encrypted persistence across restart, concurrent idempotent sequencing without
 gaps, immediate revocation, challenge throttling, immutable privacy modes,
 payload-mode enforcement, participant-role projection, coherent chain
 observation, bounded lifecycle pagination, shared stale-authorization refresh,
+delegated-request key selection, terminal security failures, persisted
+lifecycle cursors, revocation/expiry cache invalidation,
 SSE replay/live handoff and lag recovery, bounded retention, cryptographic
 context binding, and rejection of non-contributory X25519 public keys. A
 cross-repository integration test starts the real pinned-TLS service and uses

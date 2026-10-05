@@ -26,9 +26,9 @@ use crate::{
     error::{Error, Result},
     model::{
         AuthenticatedSession, ChallengeRequest, ChallengeResponse, Conversation,
-        ConversationProfileV2, MessagePayload, MessageRecord, Page, PrivacyMode,
-        ResolveConversationRequest, SessionRequest, SessionResponse, SubjectRef, SubjectSnapshot,
-        SubmitMessageRequest,
+        ConversationDelegationInfo, ConversationProfileV2, MessagePayload, MessageRecord, Page,
+        PrivacyMode, ResolveConversationRequest, SessionRequest, SessionResponse, SubjectRef,
+        SubjectSnapshot, SubmitMessageRequest,
     },
     storage::{
         Database, InsertMessageOutcome, MessageWriter, NewMessage, StoredChallenge, StoredMessage,
@@ -41,9 +41,11 @@ pub struct ConversationService {
     pub config: Arc<Config>,
     pub db: Database,
     profile: Arc<ConversationProfileV2>,
+    delegation_info: Option<Arc<ConversationDelegationInfo>>,
     direct_tls: Option<transport::PreparedDirectTls>,
     ready: Arc<AtomicBool>,
     authorization: Arc<dyn AuthorizationSource>,
+    chain_lifecycle: Option<ChainClient>,
     master_key: LocalMasterKey,
     streams: Arc<Mutex<HashMap<String, broadcast::Sender<MessageRecord>>>>,
     refresh_flights: Arc<Mutex<HashMap<String, Arc<RefreshFlight>>>>,
@@ -490,9 +492,20 @@ impl ConversationService {
     pub async fn from_config(config: Config) -> Result<Self> {
         config.validate()?;
         let db = Database::connect(&config.database.url, config.database.max_connections).await?;
-        let authorization = Arc::new(ChainClient::from_config(&config.chain).await?);
+        let chain = ChainClient::from_config(&config.chain, &config.service.service_id).await?;
+        let delegation_info = Arc::new(chain.delegation_info());
+        let chain_lifecycle = chain.clone();
+        let authorization = Arc::new(chain);
         let master_key = LocalMasterKey::from_file(&config.encryption.local_master_key_file)?;
-        Self::new(config, db, authorization, master_key).await
+        Self::new_inner(
+            config,
+            db,
+            authorization,
+            master_key,
+            Some(delegation_info),
+            Some(chain_lifecycle),
+        )
+        .await
     }
 
     pub async fn new(
@@ -500,6 +513,17 @@ impl ConversationService {
         db: Database,
         authorization: Arc<dyn AuthorizationSource>,
         master_key: LocalMasterKey,
+    ) -> Result<Self> {
+        Self::new_inner(config, db, authorization, master_key, None, None).await
+    }
+
+    async fn new_inner(
+        config: Config,
+        db: Database,
+        authorization: Arc<dyn AuthorizationSource>,
+        master_key: LocalMasterKey,
+        delegation_info: Option<Arc<ConversationDelegationInfo>>,
+        chain_lifecycle: Option<ChainClient>,
     ) -> Result<Self> {
         config.validate()?;
         let prepared_transport = transport::prepare_service_transport(&config)?;
@@ -535,6 +559,8 @@ impl ConversationService {
             sse_replay_permits: Arc::new(Semaphore::new(config.limits.max_inflight_sse_replays)),
             metrics,
             profile,
+            delegation_info,
+            chain_lifecycle,
             direct_tls: prepared_transport.direct_tls,
             ready: Arc::new(AtomicBool::new(false)),
             config: Arc::new(config),
@@ -554,6 +580,12 @@ impl ConversationService {
         &self.profile
     }
 
+    pub fn delegation_info(&self) -> Result<&ConversationDelegationInfo> {
+        self.delegation_info.as_deref().ok_or_else(|| {
+            Error::Unavailable("chain-read delegation information is unavailable".to_string())
+        })
+    }
+
     pub fn ensure_ready(&self) -> Result<()> {
         if self.ready.load(Ordering::Acquire) {
             Ok(())
@@ -567,6 +599,7 @@ impl ConversationService {
     pub async fn serve(&self) -> Result<()> {
         self.migrate().await?;
         self.db.ping().await?;
+        self.spawn_delegation_lifecycle_workers();
         self.spawn_maintenance();
         self.spawn_event_loop_monitor();
         let backend_listener = tokio::net::TcpListener::bind(self.config.listen)
@@ -1373,6 +1406,97 @@ impl ConversationService {
                 }
             }
         });
+    }
+
+    pub fn spawn_delegation_lifecycle_workers(&self) {
+        let Some(chain) = self.chain_lifecycle.clone() else {
+            return;
+        };
+        for delegate in chain.lifecycle_delegate_addresses().into_iter().take(2) {
+            let chain = chain.clone();
+            let db = self.db.clone();
+            let poll_secs = self
+                .config
+                .limits
+                .authorization_max_staleness_secs
+                .clamp(2, 60)
+                / 2;
+            tokio::spawn(async move {
+                let mut interval =
+                    tokio::time::interval(std::time::Duration::from_secs(poll_secs.max(1)));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    interval.tick().await;
+                    let mut cursor = match db.delegation_lifecycle_cursor(&delegate).await {
+                        Ok(cursor) => cursor,
+                        Err(error) => {
+                            tracing::warn!(%error, %delegate, "load delegation lifecycle cursor failed");
+                            continue;
+                        }
+                    };
+                    for _ in 0..4 {
+                        let previous_cursor = cursor;
+                        let page = match chain.delegation_lifecycle_events(&delegate, cursor).await
+                        {
+                            Ok(page) => page,
+                            Err(error) => {
+                                tracing::warn!(%error, %delegate, "poll delegation lifecycle failed");
+                                break;
+                            }
+                        };
+                        let mut next_cursor = cursor;
+                        if let Some(items) = page.get("items").and_then(serde_json::Value::as_array)
+                        {
+                            for item in items {
+                                let Some(sequence) =
+                                    item.get("seq").and_then(serde_json::Value::as_i64)
+                                else {
+                                    continue;
+                                };
+                                next_cursor = next_cursor.max(sequence);
+                                let Some(event) = item.get("event") else {
+                                    continue;
+                                };
+                                let action = event
+                                    .get("action")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or_default();
+                                if matches!(action, "revoked" | "expired") {
+                                    if let Some(delegator) =
+                                        event.get("delegator").and_then(serde_json::Value::as_str)
+                                    {
+                                        if let Err(error) =
+                                            db.invalidate_provider_authorization(delegator).await
+                                        {
+                                            tracing::warn!(%error, %delegator, "invalidate delegated authorization cache failed");
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if next_cursor > previous_cursor {
+                            if let Err(error) = db
+                                .set_delegation_lifecycle_cursor(&delegate, next_cursor)
+                                .await
+                            {
+                                tracing::warn!(%error, %delegate, "persist delegation lifecycle cursor failed");
+                                break;
+                            }
+                            cursor = next_cursor;
+                        }
+                        let has_more = page
+                            .get("page")
+                            .and_then(|value| value.get("has_more"))
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false);
+                        if !has_more || next_cursor <= previous_cursor {
+                            break;
+                        }
+                    }
+                }
+            });
+        }
     }
 
     pub fn spawn_event_loop_monitor(&self) {
